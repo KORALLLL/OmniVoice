@@ -33,8 +33,9 @@ substantially smaller than full fine-tuning.
 ## Configuration and validation
 
 `TrainingConfig` gains explicit LoRA fields rather than accepting an untyped
-nested object. The fields cover enablement, rank, alpha, dropout, bias, and
-target module suffixes. The example LoRA configuration starts from
+nested object. The fields cover enablement, rank, alpha, dropout, an explicit
+adapter-only bias policy, and target module suffixes. The bias policy is fixed
+to `none` so original model biases cannot become trainable. The example LoRA configuration starts from
 `k2-fsa/OmniVoice` and uses the broad target list.
 
 Model construction loads and resizes the complete pretrained OmniVoice model
