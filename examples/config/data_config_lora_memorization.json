@@ -1,0 +1,12 @@
+{
+    "train": [
+        {
+            "manifest_path": ["data/lora_memorization/tokens/data.lst"]
+        }
+    ],
+    "dev": [
+        {
+            "manifest_path": ["data/lora_memorization/tokens/data.lst"]
+        }
+    ]
+}
