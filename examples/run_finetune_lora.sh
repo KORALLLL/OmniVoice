@@ -35,7 +35,8 @@ data_config="config/data_config_finetune.json"
 OUTPUT_DIR="exp/omnivoice_finetune_lora"
 # =================================
 
-export PYTHONPATH="$(cd "$(dirname "$0")/.." && pwd):${PYTHONPATH:-}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PYTHONPATH="$(cd "${SCRIPT_DIR}/.." && pwd):${PYTHONPATH:-}"
 
 
 # Stage 0: Tokenize audio into WebDataset shards
@@ -77,7 +78,7 @@ if [ "${stage}" -le "1" ] && [ "${stop_stage}" -ge "1" ]; then
         --gpu_ids "${GPU_IDS}" \
         --num_processes "${NUM_GPUS}" \
         -m omnivoice.cli.train \
-        --train_config "${TRAIN_CONFIG}" \
-        --data_config "${data_config}" \
+        --train_config "${SCRIPT_DIR}/${TRAIN_CONFIG}" \
+        --data_config "${SCRIPT_DIR}/${data_config}" \
         --output_dir "${OUTPUT_DIR}"
 fi

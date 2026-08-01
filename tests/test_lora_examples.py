@@ -3,6 +3,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from omnivoice.training.config import TrainingConfig
 from omnivoice.training.lora import DEFAULT_LORA_TARGET_MODULES
 
@@ -27,13 +29,22 @@ def test_lora_example_config_loads_broad_adapter_training_defaults():
     assert config.attn_implementation == "flex_attention"
 
 
-def test_lora_example_launcher_runs_default_eight_gpu_training(tmp_path):
+@pytest.mark.parametrize(
+    ("command", "cwd"),
+    [
+        (["bash", "examples/run_finetune_lora.sh"], ROOT),
+        (["bash", "run_finetune_lora.sh"], ROOT / "examples"),
+    ],
+)
+def test_lora_example_launcher_resolves_config_from_supported_workdirs(
+    tmp_path, command, cwd
+):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     command_log = tmp_path / "commands.log"
 
-    for command in ("python", "accelerate"):
-        stub = bin_dir / command
+    for stub_name in ("python", "accelerate"):
+        stub = bin_dir / stub_name
         stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$COMMAND_LOG"\n')
         stub.chmod(0o755)
 
@@ -42,8 +53,8 @@ def test_lora_example_launcher_runs_default_eight_gpu_training(tmp_path):
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
     }
     result = subprocess.run(
-        ["bash", str(ROOT / "examples/run_finetune_lora.sh")],
-        cwd=ROOT / "examples",
+        command,
+        cwd=cwd,
         env=environment,
         capture_output=True,
         text=True,
@@ -61,9 +72,9 @@ def test_lora_example_launcher_runs_default_eight_gpu_training(tmp_path):
         "-m",
         "omnivoice.cli.train",
         "--train_config",
-        "config/train_config_finetune_lora.json",
+        str(ROOT / "examples/config/train_config_finetune_lora.json"),
         "--data_config",
-        "config/data_config_finetune.json",
+        str(ROOT / "examples/config/data_config_finetune.json"),
         "--output_dir",
         "exp/omnivoice_finetune_lora",
     ]
