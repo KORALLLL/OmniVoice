@@ -1,8 +1,8 @@
 import json
 import os
+import re
 import shlex
 import subprocess
-import tarfile
 from pathlib import Path
 
 import pytest
@@ -59,9 +59,15 @@ def test_select_records_returns_four_unique_valid_records(tmp_path):
 
 @pytest.mark.parametrize(
     ("record_id", "expected_id"),
-    [(7, "7"), (2.5, "2.5"), (True, "true")],
+    [
+        ("speaker-42_A", "speaker-42_A"),
+        (7, "ovkey_i_37"),
+        (2.5, "ovkey_f_322e35"),
+        (True, "ovkey_b_74727565"),
+        ("speaker.2", "ovkey_s_737065616b65722e32"),
+    ],
 )
-def test_select_records_normalizes_scalar_ids_to_strings(
+def test_select_records_encodes_ids_as_webdataset_safe_keys(
     tmp_path, record_id, expected_id
 ):
     manifest = _write_manifest(tmp_path, [_valid_row(tmp_path, record_id)])
@@ -70,9 +76,10 @@ def test_select_records_normalizes_scalar_ids_to_strings(
 
     assert selected["id"] == expected_id
     assert isinstance(selected["id"], str)
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", selected["id"])
 
 
-def test_select_records_enforces_uniqueness_after_id_normalization(tmp_path):
+def test_select_records_uses_type_namespaces_to_avoid_id_collisions(tmp_path):
     manifest = _write_manifest(
         tmp_path,
         [
@@ -81,20 +88,52 @@ def test_select_records_enforces_uniqueness_after_id_normalization(tmp_path):
         ],
     )
 
+    selected = select_records(manifest, count=2, seed=42)
+
+    assert {row["id"] for row in selected} == {"ovkey_i_31", "1"}
+
+
+def test_select_records_reserves_the_encoding_namespace(tmp_path):
+    encoded_unsafe_id = "ovkey_s_737065616b65722e32"
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            _valid_row(tmp_path, "speaker.2"),
+            _valid_row(tmp_path, encoded_unsafe_id),
+        ],
+    )
+
+    selected = select_records(manifest, count=2, seed=42)
+
+    assert len({row["id"] for row in selected}) == 2
+    assert encoded_unsafe_id in {row["id"] for row in selected}
+
+
+def test_select_records_enforces_uniqueness_after_final_encoding(tmp_path):
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            _valid_row(tmp_path, "speaker.2"),
+            _valid_row(tmp_path, "speaker.2"),
+        ],
+    )
+
     with pytest.raises(ValueError, match="found 1 valid unique records; need 2"):
         select_records(manifest, count=2, seed=42)
 
 
-def test_selected_numeric_id_is_a_valid_webdataset_key(tmp_path):
-    manifest = _write_manifest(tmp_path, [_valid_row(tmp_path, 42)])
+@pytest.mark.parametrize("record_id", [2.5, "speaker.2"])
+def test_selected_id_round_trips_through_webdataset(tmp_path, record_id):
+    manifest = _write_manifest(tmp_path, [_valid_row(tmp_path, record_id)])
     [selected] = select_records(manifest, count=1, seed=42)
     archive = tmp_path / "selected.tar"
 
     with wds.TarWriter(str(archive)) as writer:
-        writer.write({"__key__": selected["id"], "txt": b"compatible"})
+        writer.write({"__key__": selected["id"], "npy": b"tokens"})
 
-    with tarfile.open(archive) as reader:
-        assert reader.getnames() == ["42.txt"]
+    [sample] = list(wds.WebDataset(str(archive), shardshuffle=False))
+    assert sample["__key__"] == selected["id"]
+    assert sample["npy"] == b"tokens"
 
 
 def test_select_records_rejects_null_and_non_scalar_ids(tmp_path):

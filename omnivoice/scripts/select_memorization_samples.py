@@ -4,21 +4,44 @@
 import argparse
 import json
 import random
+import re
 from pathlib import Path
 from typing import Any
 
 
-def _normalize_record_id(value: object) -> str | None:
+_ENCODED_KEY_PREFIX = "ovkey_"
+_SAFE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _namespaced_key(type_tag: str, value: str) -> str:
+    return f"{_ENCODED_KEY_PREFIX}{type_tag}_{value.encode('utf-8').hex()}"
+
+
+def _encode_record_id(value: object) -> str | None:
+    """Encode an ID with no periods or path separators for WebDataset.
+
+    Ordinary strings using only ASCII letters, digits, underscores, and hyphens
+    remain unchanged. The ``ovkey_`` namespace is reserved; unsafe strings and
+    scalar JSON values use a type tag plus the hex-encoded UTF-8 scalar spelling.
+    """
     if isinstance(value, str):
-        normalized = value
-    elif isinstance(value, (bool, int, float)):
+        if not value.strip():
+            return None
+        if _SAFE_KEY.fullmatch(value) and not value.startswith(_ENCODED_KEY_PREFIX):
+            return value
+        return _namespaced_key("s", value)
+
+    if isinstance(value, bool):
+        return _namespaced_key("b", json.dumps(value))
+    if isinstance(value, int):
+        return _namespaced_key("i", json.dumps(value))
+    if isinstance(value, float):
         try:
-            normalized = json.dumps(value, allow_nan=False)
+            scalar = json.dumps(value, allow_nan=False)
         except ValueError:
             return None
-    else:
-        return None
-    return normalized if normalized.strip() else None
+        return _namespaced_key("f", scalar)
+    return None
 
 
 def select_records(
@@ -42,7 +65,7 @@ def select_records(
             if not isinstance(row, dict):
                 continue
 
-            record_id = _normalize_record_id(row.get("id"))
+            record_id = _encode_record_id(row.get("id"))
             if record_id is None or record_id in seen_ids:
                 continue
 
