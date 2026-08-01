@@ -26,6 +26,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Tuple
 
+from omnivoice.training.lora import DEFAULT_LORA_TARGET_MODULES
+
 
 @dataclass
 class TrainingConfig:
@@ -54,6 +56,16 @@ class TrainingConfig:
     # Init settings
     resume_from_checkpoint: Optional[str] = None
     init_from_checkpoint: Optional[str] = None
+
+    # LoRA fine-tuning
+    lora_enabled: bool = False
+    lora_rank: int = 32
+    lora_alpha: int = 64
+    lora_dropout: float = 0.05
+    lora_bias: str = "none"
+    lora_target_modules: List[str] = field(
+        default_factory=lambda: list(DEFAULT_LORA_TARGET_MODULES)
+    )
 
     # Training Hyperparams
     learning_rate: float = 1e-4
