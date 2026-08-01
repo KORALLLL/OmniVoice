@@ -157,6 +157,13 @@ def _lora_metadata(model, config, step):
             "lora_target_modules: "
             f"adapter={sorted(live_targets)!r}, config={configured_targets!r}"
         )
+    configured_base = _normalize_base_identifier(config.init_from_checkpoint)
+    live_base = peft_config.base_model_name_or_path
+    if live_base and _normalize_base_identifier(live_base) != configured_base:
+        differences.append(
+            "base_model_name_or_path: "
+            f"adapter={live_base!r}, config={config.init_from_checkpoint!r}"
+        )
     if differences:
         raise ValueError(
             "Live LoRA adapter differs from training config:\n- "
@@ -164,7 +171,7 @@ def _lora_metadata(model, config, step):
         )
     return {
         "format_version": LORA_METADATA_FORMAT_VERSION,
-        "base_model_name_or_path": config.init_from_checkpoint,
+        "base_model_name_or_path": configured_base,
         "step": step,
         **live_values,
         "lora_target_modules": configured_targets,
@@ -174,7 +181,18 @@ def _lora_metadata(model, config, step):
 def _normalize_base_identifier(value):
     if value is None:
         return None
-    return os.path.normpath(str(value).rstrip("/"))
+    raw_value = str(value).rstrip("/\\")
+    path_parts = Path(raw_value).parts
+    for index, part in enumerate(path_parts):
+        if not part.startswith("models--"):
+            continue
+        if index + 2 >= len(path_parts) or path_parts[index + 1] != "snapshots":
+            continue
+        encoded_repo = part.removeprefix("models--")
+        if "--" in encoded_repo:
+            owner, repository = encoded_repo.split("--", 1)
+            return f"{owner}/{repository}"
+    return os.path.normpath(raw_value)
 
 
 def validate_resume_metadata(config, metadata):
@@ -261,6 +279,9 @@ def save_lora_adapter(model, checkpoint_path, config, step, accelerator):
         )
         metadata_path = staging_dir / "adapter_metadata.json"
         try:
+            _active_lora_config(model).base_model_name_or_path = metadata[
+                "base_model_name_or_path"
+            ]
             model.save_pretrained(
                 staging_dir,
                 is_main_process=True,

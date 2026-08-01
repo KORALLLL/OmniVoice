@@ -154,6 +154,48 @@ def save_checkpoint_after_one_step(tmp_path, base_model):
     )
 
 
+def save_checkpoint_with_resolved_hub_base(tmp_path, base_model):
+    snapshot_path = (
+        tmp_path
+        / "hub"
+        / "models--k2-fsa--OmniVoice"
+        / "snapshots"
+        / "0123456789abcdef"
+    )
+    base_model.config._name_or_path = str(snapshot_path)
+    base_model.__dict__["name_or_path"] = str(snapshot_path)
+    config = TrainingConfig(
+        init_from_checkpoint="k2-fsa/OmniVoice",
+        output_dir=str(tmp_path),
+        lora_enabled=True,
+        lora_rank=4,
+        lora_alpha=8,
+        steps=2,
+    )
+    model, _ = apply_lora(base_model, config)
+    assert model.peft_config[model.active_adapter].base_model_name_or_path == str(
+        snapshot_path
+    )
+    optimizer = AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=1e-3,
+    )
+    scheduler = LambdaLR(optimizer, lambda _: 1.0)
+    accelerator = Accelerator(cpu=True)
+    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+    register_lora_state_hooks(accelerator)
+    save_checkpoint(
+        accelerator,
+        model,
+        DummyTokenizer(),
+        config,
+        str(tmp_path),
+        step=7,
+        keep_last_n=-1,
+    )
+    return tmp_path / "checkpoint-7"
+
+
 def assert_optimizer_state_equal(actual, expected):
     assert actual["param_groups"] == expected["param_groups"]
     assert actual["state"].keys() == expected["state"].keys()
@@ -218,6 +260,48 @@ def test_lora_checkpoint_resume_restores_adapter_and_optimizer(
     assert_optimizer_state_equal(optimizer.state_dict(), expected_optimizer)
     assert scheduler.state_dict() == expected_scheduler
     torch.testing.assert_close(torch.rand(4), expected_next_random)
+
+
+def test_hub_base_accepts_its_resolved_snapshot_identity(tmp_path, toy_omnivoice):
+    checkpoint = save_checkpoint_with_resolved_hub_base(tmp_path, toy_omnivoice)
+    config = TrainingConfig(
+        init_from_checkpoint="k2-fsa/OmniVoice",
+        lora_enabled=True,
+        lora_rank=4,
+        lora_alpha=8,
+        steps=2,
+    )
+
+    restored = load_lora_adapter(
+        ToyOmniVoice(), checkpoint, config=config, is_trainable=True
+    )
+
+    assert restored.peft_config[restored.active_adapter].r == 4
+    assert read_lora_metadata(checkpoint)["base_model_name_or_path"] == (
+        "k2-fsa/OmniVoice"
+    )
+    adapter_config = json.loads(
+        (checkpoint / "adapter" / "adapter_config.json").read_text()
+    )
+    assert adapter_config["base_model_name_or_path"] == "k2-fsa/OmniVoice"
+
+
+def test_hub_snapshot_identity_still_rejects_a_different_base(
+    tmp_path, toy_omnivoice
+):
+    checkpoint = save_checkpoint_with_resolved_hub_base(tmp_path, toy_omnivoice)
+    config = TrainingConfig(
+        init_from_checkpoint="other/OmniVoice",
+        lora_enabled=True,
+        lora_rank=4,
+        lora_alpha=8,
+        steps=2,
+    )
+
+    with pytest.raises(ValueError, match="base_model_name_or_path"):
+        load_lora_adapter(
+            ToyOmniVoice(), checkpoint, config=config, is_trainable=True
+        )
 
 
 def test_full_checkpoint_still_writes_model_weights(tmp_path, toy_omnivoice):
@@ -562,4 +646,63 @@ def test_non_main_process_receives_main_process_io_error(monkeypatch):
         lora_module._run_main_process_io(
             accelerator,
             lambda: pytest.fail("non-main process must not perform checkpoint I/O"),
+        )
+
+
+def test_save_state_rank_zero_failure_is_gathered_before_raising(
+    tmp_path, monkeypatch
+):
+    gathered_errors = []
+
+    def gather_errors(payload):
+        gathered_errors.append(list(payload))
+        return payload
+
+    monkeypatch.setattr(
+        checkpoint_module, "gather_object", gather_errors, raising=False
+    )
+    accelerator = SimpleNamespace(
+        is_main_process=True,
+        process_index=0,
+        save_state=lambda path: (_ for _ in ()).throw(
+            OSError("rank zero state write failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="rank zero state write failed"):
+        save_checkpoint(
+            accelerator,
+            model=None,
+            tokenizer=None,
+            config=TrainingConfig(lora_enabled=False),
+            output_dir=str(tmp_path),
+            step=7,
+            keep_last_n=-1,
+        )
+
+    assert gathered_errors == [["process 0 OSError: rank zero state write failed"]]
+
+
+def test_save_state_peer_receives_rank_zero_failure(tmp_path, monkeypatch):
+    def gather_rank_zero_error(payload):
+        return ["process 0 OSError: rank zero state write failed", *payload]
+
+    monkeypatch.setattr(
+        checkpoint_module, "gather_object", gather_rank_zero_error, raising=False
+    )
+    accelerator = SimpleNamespace(
+        is_main_process=False,
+        process_index=1,
+        save_state=lambda path: None,
+    )
+
+    with pytest.raises(RuntimeError, match="rank zero state write failed"):
+        save_checkpoint(
+            accelerator,
+            model=None,
+            tokenizer=None,
+            config=TrainingConfig(lora_enabled=False),
+            output_dir=str(tmp_path),
+            step=7,
+            keep_last_n=-1,
         )

@@ -34,7 +34,7 @@ from typing import Any, Dict, Optional
 
 import torch
 from accelerate import Accelerator
-from accelerate.utils import DistributedType
+from accelerate.utils import DistributedType, gather_object
 from tqdm.auto import tqdm
 
 from omnivoice.training.lora import (
@@ -44,6 +44,24 @@ from omnivoice.training.lora import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _run_all_process_io(accelerator, operation):
+    """Run per-rank state I/O and raise one gathered error on every rank."""
+    local_error = None
+    result = None
+    try:
+        result = operation()
+    except BaseException as exc:
+        process_index = getattr(accelerator, "process_index", 0)
+        local_error = f"process {process_index} {type(exc).__name__}: {exc}"
+    gathered_errors = gather_object([local_error])
+    first_error = next(
+        (error for error in gathered_errors if error is not None), None
+    )
+    if first_error is not None:
+        raise RuntimeError(f"Accelerate state I/O failed: {first_error}")
+    return result
 
 
 def _remove_path(path):
@@ -175,7 +193,9 @@ def save_checkpoint(
 
     try:
         # 1. Save Accelerator State (Optimizer, Scheduler, RNG, Scaler)
-        accelerator.save_state(staging_dir)
+        _run_all_process_io(
+            accelerator, lambda: accelerator.save_state(staging_dir)
+        )
 
         # 2. Save either the compact adapter or full model in HF format.
         unwrap_model = accelerator.unwrap_model(model)
