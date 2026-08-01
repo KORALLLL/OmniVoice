@@ -41,6 +41,7 @@ from transformers import (
 
 from omnivoice.training.checkpoint import TrainLogger, load_checkpoint
 from omnivoice.training.checkpoint import save_checkpoint as engine_save_checkpoint
+from omnivoice.training.lora import register_lora_state_hooks
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,8 @@ class OmniTrainer:
 
         # 1. Initialize Accelerator
         self.accelerator = self._init_accelerator()
+        if self.config.lora_enabled:
+            register_lora_state_hooks(self.accelerator)
 
         # 2. Setup Optimizer & Scheduler if not provided
         if optimizer is None:
@@ -199,14 +202,11 @@ class OmniTrainer:
             self.accelerator,
             self.model,
             self.tokenizer,
+            self.config,
             self.config.output_dir,
             step,
             self.config.keep_last_n_checkpoints,
         )
-        # Save config copy for convenience
-        if self.accelerator.is_main_process and hasattr(self.config, "save_to_json"):
-            checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{step}")
-            self.config.save_to_json(os.path.join(checkpoint_dir, "train_config.json"))
 
     def load_checkpoint(self, checkpoint_path):
         """Wrapper for loading."""

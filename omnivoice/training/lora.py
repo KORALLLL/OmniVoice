@@ -1,5 +1,12 @@
-"""LoRA configuration validation and target discovery helpers."""
+"""LoRA configuration, checkpoint, and target discovery helpers."""
 
+import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
+from accelerate.utils import DistributedType, broadcast_object_list
 from peft import LoraConfig, PeftModel, get_peft_model
 
 
@@ -15,6 +22,27 @@ DEFAULT_LORA_TARGET_MODULES = (
     "audio_embeddings",
     "audio_heads",
 )
+
+LORA_METADATA_FORMAT_VERSION = 1
+
+
+def _run_main_process_io(accelerator, operation):
+    """Run main-rank I/O and propagate failures before any rank raises."""
+    error = [None]
+    result = None
+    caught_error = None
+    if accelerator.is_main_process:
+        try:
+            result = operation()
+        except BaseException as exc:
+            caught_error = exc
+            error[0] = f"{type(exc).__name__}: {exc}"
+    broadcast_object_list(error)
+    if error[0] is not None:
+        if caught_error is not None:
+            raise caught_error
+        raise RuntimeError(f"Main process checkpoint I/O failed: {error[0]}")
+    return result
 
 
 def find_lora_target_modules(model, suffixes):
@@ -76,10 +104,222 @@ def apply_lora(model, config):
     return model, matches
 
 
-def load_lora_adapter(model, checkpoint_path, is_trainable):
+def resolve_adapter_dir(checkpoint_path):
+    """Return ``(checkpoint_root, adapter_dir)`` for a checkpoint or adapter path."""
+    path = Path(checkpoint_path)
+    nested_adapter = path / "adapter"
+    if nested_adapter.is_dir():
+        return path, nested_adapter
+    if (path / "adapter_config.json").is_file():
+        return path.parent, path
+    raise FileNotFoundError(f"LoRA adapter not found at {path}")
+
+
+def read_lora_metadata(checkpoint_path):
+    """Read and validate schema-v1 metadata from a checkpoint root."""
+    metadata_path = Path(checkpoint_path) / "adapter_metadata.json"
+    with metadata_path.open() as metadata_file:
+        metadata = json.load(metadata_file)
+    if metadata.get("format_version") != LORA_METADATA_FORMAT_VERSION:
+        raise ValueError(
+            "Unsupported LoRA metadata format_version: "
+            f"{metadata.get('format_version')!r}"
+        )
+    return metadata
+
+
+def _active_lora_config(model):
+    active_adapter = model.active_adapter
+    if not isinstance(active_adapter, str):
+        raise ValueError("LoRA checkpoint saving requires exactly one active adapter")
+    return model.peft_config[active_adapter]
+
+
+def _lora_metadata(model, config, step):
+    peft_config = _active_lora_config(model)
+    live_values = {
+        "lora_rank": peft_config.r,
+        "lora_alpha": peft_config.lora_alpha,
+        "lora_dropout": peft_config.lora_dropout,
+        "lora_bias": peft_config.bias,
+    }
+    differences = []
+    for field, actual_value in live_values.items():
+        expected_value = getattr(config, field)
+        if actual_value != expected_value:
+            differences.append(
+                f"{field}: adapter={actual_value!r}, config={expected_value!r}"
+            )
+    live_targets = set(peft_config.target_modules)
+    configured_targets = list(config.lora_target_modules)
+    if live_targets != set(configured_targets):
+        differences.append(
+            "lora_target_modules: "
+            f"adapter={sorted(live_targets)!r}, config={configured_targets!r}"
+        )
+    if differences:
+        raise ValueError(
+            "Live LoRA adapter differs from training config:\n- "
+            + "\n- ".join(differences)
+        )
+    return {
+        "format_version": LORA_METADATA_FORMAT_VERSION,
+        "base_model_name_or_path": config.init_from_checkpoint,
+        "step": step,
+        **live_values,
+        "lora_target_modules": configured_targets,
+    }
+
+
+def _normalize_base_identifier(value):
+    if value is None:
+        return None
+    return os.path.normpath(str(value).rstrip("/"))
+
+
+def validate_resume_metadata(config, metadata):
+    """Reject every incompatible adapter setting in one diagnostic."""
+    expected = {
+        "base_model_name_or_path": config.init_from_checkpoint,
+        "lora_rank": config.lora_rank,
+        "lora_alpha": config.lora_alpha,
+        "lora_dropout": config.lora_dropout,
+        "lora_bias": config.lora_bias,
+        "lora_target_modules": list(config.lora_target_modules),
+    }
+    differences = []
+    for field, expected_value in expected.items():
+        actual_value = metadata.get(field)
+        if field == "base_model_name_or_path":
+            values_match = _normalize_base_identifier(
+                actual_value
+            ) == _normalize_base_identifier(expected_value)
+        else:
+            values_match = actual_value == expected_value
+        if not values_match:
+            differences.append(
+                f"{field}: checkpoint={actual_value!r}, config={expected_value!r}"
+            )
+    if differences:
+        raise ValueError(
+            "LoRA checkpoint metadata is incompatible:\n- "
+            + "\n- ".join(differences)
+        )
+
+
+def _validate_adapter_config(adapter_dir, metadata):
+    adapter_config_path = Path(adapter_dir) / "adapter_config.json"
+    with adapter_config_path.open() as adapter_config_file:
+        adapter_config = json.load(adapter_config_file)
+    field_mapping = {
+        "r": "lora_rank",
+        "lora_alpha": "lora_alpha",
+        "lora_dropout": "lora_dropout",
+        "bias": "lora_bias",
+    }
+    differences = []
+    for adapter_field, metadata_field in field_mapping.items():
+        actual_value = adapter_config.get(adapter_field)
+        expected_value = metadata.get(metadata_field)
+        if actual_value != expected_value:
+            differences.append(
+                f"adapter_config.{adapter_field}: "
+                f"adapter={actual_value!r}, metadata={expected_value!r}"
+            )
+    adapter_targets = set(adapter_config.get("target_modules") or [])
+    metadata_targets = metadata.get("lora_target_modules") or []
+    if adapter_targets != set(metadata_targets):
+        differences.append(
+            "adapter_config.target_modules: "
+            f"adapter={sorted(adapter_targets)!r}, metadata={metadata_targets!r}"
+        )
+    adapter_base = adapter_config.get("base_model_name_or_path")
+    metadata_base = metadata.get("base_model_name_or_path")
+    if adapter_base and _normalize_base_identifier(
+        adapter_base
+    ) != _normalize_base_identifier(metadata_base):
+        differences.append(
+            "adapter_config.base_model_name_or_path: "
+            f"adapter={adapter_base!r}, metadata={metadata_base!r}"
+        )
+    if differences:
+        raise ValueError(
+            "PEFT adapter config differs from checkpoint metadata:\n- "
+            + "\n- ".join(differences)
+        )
+
+
+def save_lora_adapter(model, checkpoint_path, config, step, accelerator):
+    """Stage and atomically publish an adapter plus its checkpoint metadata."""
+    checkpoint_root = Path(checkpoint_path)
+    metadata = _lora_metadata(model, config, step)
+
+    def save_files():
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix=".adapter-", dir=str(checkpoint_root))
+        )
+        metadata_path = staging_dir / "adapter_metadata.json"
+        try:
+            model.save_pretrained(
+                staging_dir,
+                is_main_process=True,
+                save_function=accelerator.save,
+                safe_serialization=True,
+                save_embedding_layers=False,
+            )
+            with metadata_path.open("w") as metadata_file:
+                json.dump(metadata, metadata_file, indent=2)
+                metadata_file.write("\n")
+
+            final_adapter_dir = checkpoint_root / "adapter"
+            final_metadata_path = checkpoint_root / "adapter_metadata.json"
+            os.replace(metadata_path, final_metadata_path)
+            if final_adapter_dir.exists():
+                shutil.rmtree(final_adapter_dir)
+            os.replace(staging_dir, final_adapter_dir)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+
+    _run_main_process_io(accelerator, save_files)
+
+
+def register_lora_state_hooks(accelerator):
+    """Suppress full-model state while retaining other Accelerate state."""
+    unsupported_backends = {
+        DistributedType.DEEPSPEED,
+        DistributedType.FSDP,
+        DistributedType.MEGATRON_LM,
+    }
+    if accelerator.distributed_type in unsupported_backends:
+        raise ValueError(
+            "Adapter-only LoRA checkpoints do not support Accelerate backend "
+            f"{accelerator.distributed_type.value}"
+        )
+
+    def save_hook(models, weights, output_dir):
+        weights.clear()
+
+    def load_hook(models, input_dir):
+        models.clear()
+
+    accelerator.register_save_state_pre_hook(save_hook)
+    accelerator.register_load_state_pre_hook(load_hook)
+
+
+def load_lora_adapter(model, checkpoint_path, config=None, is_trainable=False):
     """Load a saved LoRA adapter into a base model."""
+    checkpoint_root, adapter_dir = resolve_adapter_dir(checkpoint_path)
+    is_checkpoint_adapter = adapter_dir == checkpoint_root / "adapter"
+    metadata_path = checkpoint_root / "adapter_metadata.json"
+    if is_checkpoint_adapter or metadata_path.is_file() or config is not None:
+        metadata = read_lora_metadata(checkpoint_root)
+        _validate_adapter_config(adapter_dir, metadata)
+    if config is not None:
+        validate_resume_metadata(config, metadata)
     return PeftModel.from_pretrained(
-        model, checkpoint_path, is_trainable=is_trainable
+        model, adapter_dir, is_trainable=is_trainable
     )
 
 

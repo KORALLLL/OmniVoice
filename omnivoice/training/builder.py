@@ -63,7 +63,12 @@ def _finalize_training_model(model, tokenizer, config):
 
     if len(tokenizer) != llm_config.vocab_size:
         resize_model = getattr(model, "llm", model)
-        resize_model.resize_token_embeddings(len(tokenizer))
+        if config.lora_enabled:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(config.seed)
+                resize_model.resize_token_embeddings(len(tokenizer))
+        else:
+            resize_model.resize_token_embeddings(len(tokenizer))
         llm_config.vocab_size = len(tokenizer)
 
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -75,6 +80,7 @@ def _finalize_training_model(model, tokenizer, config):
             model = load_lora_adapter(
                 model,
                 config.resume_from_checkpoint,
+                config=config,
                 is_trainable=True,
             )
         else:

@@ -34,9 +34,45 @@ from typing import Any, Dict, Optional
 
 import torch
 from accelerate import Accelerator
+from accelerate.utils import DistributedType
 from tqdm.auto import tqdm
 
+from omnivoice.training.lora import (
+    _run_main_process_io,
+    is_lora_model,
+    save_lora_adapter,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _remove_path(path):
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def _publish_checkpoint(staging_dir, checkpoint_dir):
+    """Publish a complete checkpoint, restoring the prior one on failure."""
+    checkpoint_parent = os.path.dirname(checkpoint_dir)
+    checkpoint_name = os.path.basename(checkpoint_dir)
+    backup_dir = os.path.join(checkpoint_parent, f".{checkpoint_name}.old")
+    if os.path.exists(backup_dir):
+        if os.path.exists(checkpoint_dir):
+            _remove_path(backup_dir)
+        else:
+            os.replace(backup_dir, checkpoint_dir)
+    if os.path.exists(checkpoint_dir):
+        os.replace(checkpoint_dir, backup_dir)
+    try:
+        os.replace(staging_dir, checkpoint_dir)
+    except BaseException:
+        if os.path.exists(backup_dir):
+            os.replace(backup_dir, checkpoint_dir)
+        raise
+    if os.path.exists(backup_dir):
+        _remove_path(backup_dir)
 
 
 class TrainLogger:
@@ -119,6 +155,7 @@ def save_checkpoint(
     accelerator: Accelerator,
     model: torch.nn.Module,
     tokenizer: Any,
+    config: Any,
     output_dir: str,
     step: int,
     keep_last_n: int = 3,
@@ -128,40 +165,83 @@ def save_checkpoint(
     Manages rotation of checkpoints.
     """
     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
+    staging_dir = os.path.join(output_dir, f".checkpoint-{step}.tmp")
 
-    # 1. Save Accelerator State (Optimizer, Scheduler, RNG, Scaler)
-    accelerator.save_state(checkpoint_dir)
+    def prepare_staging_dir():
+        os.makedirs(output_dir, exist_ok=True)
+        _remove_path(staging_dir)
 
-    # 2. Save Model in HF format (config.json + pytorch_model.bin/safetensors)
-    unwrap_model = accelerator.unwrap_model(model)
-    unwrap_model.save_pretrained(
-        checkpoint_dir,
-        is_main_process=accelerator.is_main_process,
-        save_function=accelerator.save,
-    )
+    _run_main_process_io(accelerator, prepare_staging_dir)
 
-    # 3. Save Tokenizer
-    if accelerator.is_main_process:
-        tokenizer.save_pretrained(checkpoint_dir)
+    try:
+        # 1. Save Accelerator State (Optimizer, Scheduler, RNG, Scaler)
+        accelerator.save_state(staging_dir)
+
+        # 2. Save either the compact adapter or full model in HF format.
+        unwrap_model = accelerator.unwrap_model(model)
+        if is_lora_model(unwrap_model):
+            save_lora_adapter(
+                unwrap_model,
+                staging_dir,
+                config=config,
+                step=step,
+                accelerator=accelerator,
+            )
+        else:
+            sharded_backends = {
+                DistributedType.DEEPSPEED,
+                DistributedType.FSDP,
+                DistributedType.MEGATRON_LM,
+            }
+            if accelerator.distributed_type in sharded_backends:
+                unwrap_model.save_pretrained(
+                    staging_dir,
+                    is_main_process=accelerator.is_main_process,
+                    save_function=accelerator.save,
+                )
+            else:
+                def save_full_model():
+                    unwrap_model.save_pretrained(
+                        staging_dir,
+                        is_main_process=True,
+                        save_function=accelerator.save,
+                    )
+
+                _run_main_process_io(accelerator, save_full_model)
+
+        # 3. Save tokenizer/config, then publish the complete checkpoint.
+        def save_metadata_and_publish():
+            tokenizer.save_pretrained(staging_dir)
+            if hasattr(config, "save_to_json"):
+                config.save_to_json(os.path.join(staging_dir, "train_config.json"))
+            _publish_checkpoint(staging_dir, checkpoint_dir)
+
+        _run_main_process_io(accelerator, save_metadata_and_publish)
+    except BaseException:
+        if accelerator.is_main_process:
+            _remove_path(staging_dir)
+        raise
 
     logger.info(f"Saved checkpoint to {checkpoint_dir}")
 
     # 4. Rotate checkpoints (Keep last N)
-    if accelerator.is_main_process and keep_last_n > 0:
-        checkpoints = [
-            d
-            for d in os.listdir(output_dir)
-            if d.startswith("checkpoint-")
-            and os.path.isdir(os.path.join(output_dir, d))
-        ]
-        # Sort by step number
-        checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+    if keep_last_n > 0:
+        def rotate_checkpoints():
+            checkpoints = [
+                d
+                for d in os.listdir(output_dir)
+                if d.startswith("checkpoint-")
+                and os.path.isdir(os.path.join(output_dir, d))
+            ]
+            checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
 
-        if len(checkpoints) > keep_last_n:
-            to_remove = checkpoints[:-keep_last_n]
-            for d in to_remove:
-                shutil.rmtree(os.path.join(output_dir, d))
-                logger.info(f"Removed old checkpoint {d}")
+            if len(checkpoints) > keep_last_n:
+                to_remove = checkpoints[:-keep_last_n]
+                for checkpoint in to_remove:
+                    shutil.rmtree(os.path.join(output_dir, checkpoint))
+                    logger.info(f"Removed old checkpoint {checkpoint}")
+
+        _run_main_process_io(accelerator, rotate_checkpoints)
 
 
 def load_checkpoint(accelerator: Accelerator, checkpoint_path: str):
