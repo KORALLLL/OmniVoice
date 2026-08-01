@@ -384,6 +384,14 @@ CUDA graphs are recommended for single-stream (batch=1) usage, where kernel-laun
 
 See [examples/](examples/) for the complete pipeline — from data preparation to training, evaluation, and finetuning.
 
+For adapter-only fine-tuning on eight GPUs, start with
+[examples/run_finetune_lora.sh](examples/run_finetune_lora.sh). It tokenizes
+JSONL data and launches rank-32 LoRA training on GPUs `0`–`7`, writing
+restartable adapter checkpoints to `exp/omnivoice_finetune_lora`. See
+[docs/training.md](docs/training.md#lora-fine-tuning) for resuming, changing
+broad LoRA targets, global token-batch sizing, checkpoint contents, and
+adapter inference.
+
 ---
 
 ## Discussion & Communication

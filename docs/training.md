@@ -84,6 +84,73 @@ Set `resume_from_checkpoint` in your training config to resume from an existing 
 }
 ```
 
+## LoRA Fine-tuning
+
+For an eight-GPU adapter-only workflow, use
+[examples/run_finetune_lora.sh](../examples/run_finetune_lora.sh) with
+[examples/config/train_config_finetune_lora.json](../examples/config/train_config_finetune_lora.json).
+It defaults to GPUs `0` through `7`, eight processes, and output directory
+`exp/omnivoice_finetune_lora`. The example keeps the `flex_attention` and
+bf16 defaults and starts large-dataset LoRA training at a learning rate of
+`0.0001`.
+
+The effective global token batch is:
+
+```
+batch_tokens × num_processes × gradient_accumulation_steps
+```
+
+With the example defaults this is `8192 × 8 × 1 = 65536` tokens. Reduce one
+of these factors if memory or optimization behavior requires a smaller global
+batch.
+
+The config enables rank-32 LoRA with alpha 64, dropout 0.05, and no bias. Its
+broad default targets include attention and MLP projections plus
+`embed_tokens`, `audio_embeddings`, and `audio_heads`. To adapt a different
+subset, edit `lora_target_modules`; each requested module suffix must match
+the selected base model.
+
+### Resume an adapter run
+
+Each checkpoint is restartable: it contains Accelerator state (optimizer,
+scheduler, and RNG state), tokenizer and training config files, plus an
+`adapter/` directory with the PEFT adapter weights/config and an
+`adapter_metadata.json` file. It does not contain a duplicate copy of the
+frozen base-model weights. To resume, set the original LoRA config's
+`resume_from_checkpoint` to a checkpoint, preserve its base and LoRA settings,
+then run stage 1:
+
+```json
+{
+    "resume_from_checkpoint": "exp/omnivoice_finetune_lora/checkpoint-5000"
+}
+```
+
+```bash
+# In examples/run_finetune_lora.sh, set stage=1 and stop_stage=1 first.
+bash examples/run_finetune_lora.sh
+```
+
+Keep `init_from_checkpoint` accessible locally or from Hugging Face when
+resuming or loading an adapter. The adapter metadata records that base model,
+and the adapter alone cannot generate audio without it.
+
+### Load a LoRA adapter for inference
+
+`OmniVoice.from_lora_pretrained` reads the recorded base model, loads it, and
+then attaches the adapter checkpoint:
+
+```python
+from omnivoice import OmniVoice
+import torch
+
+model = OmniVoice.from_lora_pretrained(
+    "exp/omnivoice_finetune_lora/checkpoint-5000",
+    device_map="cuda:0",
+    dtype=torch.float16,
+)
+```
+
 ## Initializing from a Pretrained Model
 
 To start training from a pretrained OmniVoice checkpoint (for fine-tuning):

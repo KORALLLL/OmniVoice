@@ -6,6 +6,7 @@ This directory contains scripts and configs for training, fine-tuning, and evalu
 |---|---|---|
 | Training from scratch | [run_emilia.sh](run_emilia.sh) | Full pipeline on the Emilia dataset (data check, tokenization, training) |
 | Fine-tuning | [run_finetune.sh](run_finetune.sh) | Fine-tune from a pretrained checkpoint using your own JSONL data |
+| Eight-GPU LoRA fine-tuning | [run_finetune_lora.sh](run_finetune_lora.sh) | Train adapter-only LoRA checkpoints from a pretrained OmniVoice model |
 | Evaluation | [run_eval.sh](run_eval.sh) | Evaluate WER, speaker similarity, and UTMOS on standard test sets |
 
 ---
@@ -97,6 +98,34 @@ Main difference between fine-tuning config ([config/train_config_finetune.json](
 To use a different pretrained checkpoint, modify `init_from_checkpoint` in the config file.
 
 If you encounter issues with `flex_attention` on your GPU, use [config/train_config_finetune_sdpa.json](config/train_config_finetune_sdpa.json) instead, which uses SDPA attention for broader compatibility. See [docs/training.md](../docs/training.md#attention-implementation) for details.
+
+---
+
+## Eight-GPU LoRA Fine-tuning
+
+[run_finetune_lora.sh](run_finetune_lora.sh) is the adapter-only fine-tuning
+example. It defaults to GPUs `0,1,2,3,4,5,6,7`, eight processes, the broad
+LoRA config [config/train_config_finetune_lora.json](config/train_config_finetune_lora.json),
+and `exp/omnivoice_finetune_lora` for output. From this directory, run:
+
+```bash
+bash run_finetune_lora.sh
+```
+
+As with the regular fine-tuning script, stage 0 tokenizes raw JSONL data and
+stage 1 trains. Edit `stage` and `stop_stage` at the top of the script to
+restart only one stage; after tokenization, set both to `1` to skip it.
+
+The example uses rank 32, alpha 64, dropout 0.05, no LoRA bias, and broad
+targets covering attention, MLP, text embedding, audio embedding, and audio
+head projections. Adjust `lora_target_modules` in the config if you want a
+narrower or different adapter; every requested target must exist in the base
+model. The effective global token batch is
+`batch_tokens × num_processes × gradient_accumulation_steps` (the defaults are
+`8192 × 8 × 1 = 65536` tokens).
+
+For resume and inference details, including the adapter-only checkpoint layout
+and required base model, see [LoRA fine-tuning](../docs/training.md#lora-fine-tuning).
 
 ---
 
