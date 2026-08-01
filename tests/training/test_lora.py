@@ -3,7 +3,11 @@ import re
 
 import pytest
 
+from conftest import DummyTokenizer, ToyOmniVoice
+from omnivoice.training import builder
 from omnivoice.training.config import TrainingConfig
+from omnivoice.training.lora import apply_lora
+from omnivoice.training.trainer import OmniTrainer
 
 
 def test_training_config_loads_broad_lora_defaults(tmp_path):
@@ -111,3 +115,42 @@ def test_load_lora_adapter_restores_non_trainable_adapter(tmp_path, toy_omnivoic
     assert is_lora_model(adapter)
     assert is_lora_model(restored)
     assert not any(parameter.requires_grad for parameter in restored.parameters())
+
+
+@pytest.mark.builder
+def test_finalize_training_model_resizes_before_applying_lora(monkeypatch):
+    calls = []
+    model = ToyOmniVoice()
+    original_resize = model.resize_token_embeddings
+    monkeypatch.setattr(
+        model,
+        "resize_token_embeddings",
+        lambda size: calls.append("resize") or original_resize(size),
+    )
+    monkeypatch.setattr(
+        builder,
+        "apply_lora",
+        lambda value, config: (calls.append("lora") or value, {}),
+    )
+    config = TrainingConfig(init_from_checkpoint="base", lora_enabled=True)
+    tokenizer = DummyTokenizer()
+    tokenizer.__class__.__len__ = lambda self: 33
+
+    finalized = builder._finalize_training_model(model, tokenizer, config)
+
+    assert finalized is model
+    assert calls == ["resize", "lora"]
+
+
+def test_optimizer_contains_only_trainable_parameters(toy_omnivoice):
+    config = TrainingConfig(init_from_checkpoint="base", lora_enabled=True, steps=2)
+    model, _ = apply_lora(toy_omnivoice, config)
+    trainer = object.__new__(OmniTrainer)
+    trainer.model = model
+    trainer.config = config
+
+    optimizer, _ = trainer.create_optimizer_and_scheduler()
+
+    optimizer_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    expected_ids = {id(p) for p in model.parameters() if p.requires_grad}
+    assert optimizer_ids == expected_ids

@@ -48,13 +48,52 @@ from omnivoice.data.dataset import WebDatasetReader, prepare_data_manifests_from
 from omnivoice.data.processor import OmniVoiceSampleProcessor
 from omnivoice.models.omnivoice import OmniVoice, OmniVoiceConfig, _resolve_model_path
 from omnivoice.training.config import TrainingConfig
+from omnivoice.training.lora import (
+    apply_lora,
+    load_lora_adapter,
+    trainable_parameter_counts,
+)
 
 logger = logging.getLogger(__name__)
 
 
+def _finalize_training_model(model, tokenizer, config):
+    """Apply tokenizer-dependent model setup and optional LoRA adapters."""
+    llm_config = getattr(model.config, "llm_config", model.config)
+
+    if len(tokenizer) != llm_config.vocab_size:
+        resize_model = getattr(model, "llm", model)
+        resize_model.resize_token_embeddings(len(tokenizer))
+        llm_config.vocab_size = len(tokenizer)
+
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.bos_token_id = tokenizer.bos_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+
+    if config.lora_enabled:
+        if config.resume_from_checkpoint:
+            model = load_lora_adapter(
+                model,
+                config.resume_from_checkpoint,
+                is_trainable=True,
+            )
+        else:
+            model, matches = apply_lora(model, config)
+            logger.info("Matched LoRA modules: %s", matches)
+        trainable, total = trainable_parameter_counts(model)
+        logger.info(
+            "LoRA trainable parameters: %d / %d (%.4f%%)",
+            trainable,
+            total,
+            100.0 * trainable / total,
+        )
+
+    return model
+
+
 def build_model_and_tokenizer(
     config: TrainingConfig,
-) -> Tuple[OmniVoice, AutoTokenizer]:
+) -> Tuple[torch.nn.Module, AutoTokenizer]:
     """Load Tokenizer and Model, handle resizing and special tokens."""
     logger.info("Initializing Model & Tokenizer...")
 
@@ -115,17 +154,7 @@ def build_model_and_tokenizer(
         hf_logging.set_verbosity(original_level)
         model = OmniVoice(config=ov_config, llm=llm)
 
-    # 3. Resize Embeddings
-    if len(tokenizer) != model.config.llm_config.vocab_size:
-        model.llm.resize_token_embeddings(len(tokenizer))
-        model.config.llm_config.vocab_size = len(tokenizer)
-
-    # 4. Config IDs
-    model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.bos_token_id = tokenizer.bos_token_id
-    model.config.eos_token_id = tokenizer.eos_token_id
-
-    return model, tokenizer
+    return _finalize_training_model(model, tokenizer, config), tokenizer
 
 
 def build_dataloaders(
