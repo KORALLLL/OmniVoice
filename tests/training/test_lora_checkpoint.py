@@ -7,12 +7,12 @@ import pytest
 import torch
 from accelerate import Accelerator
 from accelerate.utils import DistributedType
+from conftest import DummyTokenizer, ToyOmniVoice
 from peft import get_peft_model_state_dict
 from safetensors import safe_open
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from conftest import DummyTokenizer, ToyOmniVoice
 from omnivoice.training import builder
 from omnivoice.training import checkpoint as checkpoint_module
 from omnivoice.training import lora as lora_module
@@ -68,7 +68,7 @@ def test_lora_checkpoint_omits_frozen_model_and_contains_adapter(
     with safe_open(
         checkpoint / "adapter" / "adapter_model.safetensors", framework="pt"
     ) as adapter_file:
-        assert all("base_layer" not in key for key in adapter_file.keys())
+        assert all("base_layer" not in key for key in adapter_file.keys())  # noqa: SIM118
 
     assert read_lora_metadata(checkpoint) == {
         "format_version": 1,

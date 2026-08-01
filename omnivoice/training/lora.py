@@ -9,7 +9,6 @@ from pathlib import Path
 from accelerate.utils import DistributedType, broadcast_object_list
 from peft import LoraConfig, PeftModel, get_peft_model
 
-
 DEFAULT_LORA_TARGET_MODULES = (
     "q_proj",
     "k_proj",
@@ -34,7 +33,7 @@ def _run_main_process_io(accelerator, operation):
     if accelerator.is_main_process:
         try:
             result = operation()
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001
             caught_error = exc
             error[0] = f"{type(exc).__name__}: {exc}"
     broadcast_object_list(error)
@@ -131,7 +130,7 @@ def read_lora_metadata(checkpoint_path):
 def _active_lora_config(model):
     active_adapter = model.active_adapter
     if not isinstance(active_adapter, str):
-        raise ValueError("LoRA checkpoint saving requires exactly one active adapter")
+        raise TypeError("LoRA checkpoint saving requires exactly one active adapter")
     return model.peft_config[active_adapter]
 
 

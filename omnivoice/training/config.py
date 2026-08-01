@@ -63,7 +63,7 @@ class TrainingConfig:
     lora_alpha: int = 64
     lora_dropout: float = 0.05
     lora_bias: str = "none"
-    lora_target_modules: List[str] = field(
+    lora_target_modules: list[str] = field(
         default_factory=lambda: list(DEFAULT_LORA_TARGET_MODULES)
     )
 

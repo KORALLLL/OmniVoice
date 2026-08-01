@@ -54,7 +54,7 @@ def _run_all_process_io(accelerator, operation):
     result = None
     try:
         result = operation()
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001
         process_index = getattr(accelerator, "process_index", 0)
         local_error = f"process {process_index} {type(exc).__name__}: {exc}"
     gathered_errors = gather_object([local_error])
