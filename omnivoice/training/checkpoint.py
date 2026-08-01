@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 def _run_all_process_io(accelerator, operation):
     """Run per-rank state I/O and raise one gathered error on every rank."""
+    if getattr(accelerator, "distributed_type", None) == DistributedType.XLA:
+        return operation()
     local_error = None
     result = None
     try:

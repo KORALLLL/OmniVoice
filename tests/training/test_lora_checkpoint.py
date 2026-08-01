@@ -706,3 +706,41 @@ def test_save_state_peer_receives_rank_zero_failure(tmp_path, monkeypatch):
             step=7,
             keep_last_n=-1,
         )
+
+
+def test_xla_full_checkpoint_does_not_use_unsupported_object_gather(
+    tmp_path, monkeypatch
+):
+    class XlaFullModel:
+        def save_pretrained(self, path, **kwargs):
+            path = Path(path)
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "model.safetensors").write_bytes(b"xla model")
+
+    def unsupported_gather(payload):
+        raise NotImplementedError("gather objects in TPU is not supported")
+
+    monkeypatch.setattr(checkpoint_module, "gather_object", unsupported_gather)
+    model = XlaFullModel()
+    accelerator = SimpleNamespace(
+        is_main_process=True,
+        process_index=0,
+        distributed_type=DistributedType.XLA,
+        save_state=lambda path: Path(path).mkdir(parents=True, exist_ok=True),
+        unwrap_model=lambda wrapped_model: wrapped_model,
+        save=torch.save,
+    )
+
+    save_checkpoint(
+        accelerator,
+        model,
+        DummyTokenizer(),
+        TrainingConfig(lora_enabled=False),
+        str(tmp_path),
+        step=7,
+        keep_last_n=-1,
+    )
+
+    checkpoint = tmp_path / "checkpoint-7"
+    assert (checkpoint / "model.safetensors").read_bytes() == b"xla model"
+    assert (checkpoint / "tokenizer_config.json").is_file()
