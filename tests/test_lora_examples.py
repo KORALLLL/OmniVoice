@@ -8,7 +8,6 @@ import pytest
 from omnivoice.training.config import TrainingConfig
 from omnivoice.training.lora import DEFAULT_LORA_TARGET_MODULES
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 

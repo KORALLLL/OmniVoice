@@ -8,7 +8,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-
 _ENCODED_KEY_PREFIX = "ovkey_"
 _SAFE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
