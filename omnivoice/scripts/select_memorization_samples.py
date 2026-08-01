@@ -8,6 +8,19 @@ from pathlib import Path
 from typing import Any
 
 
+def _normalize_record_id(value: object) -> str | None:
+    if isinstance(value, str):
+        normalized = value
+    elif isinstance(value, (bool, int, float)):
+        try:
+            normalized = json.dumps(value, allow_nan=False)
+        except ValueError:
+            return None
+    else:
+        return None
+    return normalized if normalized.strip() else None
+
+
 def select_records(
     input_path: str | Path, count: int, seed: int
 ) -> list[dict[str, Any]]:
@@ -17,7 +30,7 @@ def select_records(
 
     source = Path(input_path)
     valid_records: list[dict[str, Any]] = []
-    seen_ids: set[object] = set()
+    seen_ids: set[str] = set()
 
     with source.open("r", encoding="utf-8") as manifest:
         for line in manifest:
@@ -29,10 +42,8 @@ def select_records(
             if not isinstance(row, dict):
                 continue
 
-            record_id = row.get("id")
-            if not isinstance(record_id, (str, int, float)) or record_id in seen_ids:
-                continue
-            if isinstance(record_id, str) and not record_id.strip():
+            record_id = _normalize_record_id(row.get("id"))
+            if record_id is None or record_id in seen_ids:
                 continue
 
             text = row.get("text")
@@ -50,6 +61,7 @@ def select_records(
                 continue
 
             selected_row = dict(row)
+            selected_row["id"] = record_id
             selected_row["audio_path"] = str(resolved_audio)
             valid_records.append(selected_row)
             seen_ids.add(record_id)

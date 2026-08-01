@@ -2,9 +2,11 @@ import json
 import os
 import shlex
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
+import webdataset as wds
 
 from omnivoice.scripts.select_memorization_samples import select_records
 
@@ -20,7 +22,7 @@ def _write_manifest(tmp_path: Path, rows: list[object]) -> Path:
     return manifest
 
 
-def _valid_row(tmp_path: Path, record_id: str) -> dict[str, str]:
+def _valid_row(tmp_path: Path, record_id: object) -> dict[str, object]:
     audio_path = tmp_path / f"{record_id}.wav"
     audio_path.touch()
     return {
@@ -53,6 +55,58 @@ def test_select_records_returns_four_unique_valid_records(tmp_path):
     assert len(first) == 4
     assert len({row["id"] for row in first}) == 4
     assert all(Path(row["audio_path"]).is_file() for row in first)
+
+
+@pytest.mark.parametrize(
+    ("record_id", "expected_id"),
+    [(7, "7"), (2.5, "2.5"), (True, "true")],
+)
+def test_select_records_normalizes_scalar_ids_to_strings(
+    tmp_path, record_id, expected_id
+):
+    manifest = _write_manifest(tmp_path, [_valid_row(tmp_path, record_id)])
+
+    [selected] = select_records(manifest, count=1, seed=42)
+
+    assert selected["id"] == expected_id
+    assert isinstance(selected["id"], str)
+
+
+def test_select_records_enforces_uniqueness_after_id_normalization(tmp_path):
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            _valid_row(tmp_path, 1),
+            _valid_row(tmp_path, "1"),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="found 1 valid unique records; need 2"):
+        select_records(manifest, count=2, seed=42)
+
+
+def test_selected_numeric_id_is_a_valid_webdataset_key(tmp_path):
+    manifest = _write_manifest(tmp_path, [_valid_row(tmp_path, 42)])
+    [selected] = select_records(manifest, count=1, seed=42)
+    archive = tmp_path / "selected.tar"
+
+    with wds.TarWriter(str(archive)) as writer:
+        writer.write({"__key__": selected["id"], "txt": b"compatible"})
+
+    with tarfile.open(archive) as reader:
+        assert reader.getnames() == ["42.txt"]
+
+
+def test_select_records_rejects_null_and_non_scalar_ids(tmp_path):
+    rows = [
+        _valid_row(tmp_path, None),
+        _valid_row(tmp_path, ["list"]),
+        _valid_row(tmp_path, {"mapping": "id"}),
+    ]
+    manifest = _write_manifest(tmp_path, rows)
+
+    with pytest.raises(ValueError, match="found 0 valid unique records; need 1"):
+        select_records(manifest, count=1, seed=42)
 
 
 def test_select_records_reports_available_count(tmp_path):
