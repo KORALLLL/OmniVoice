@@ -344,6 +344,14 @@ def load_lora_adapter(model, checkpoint_path, config=None, is_trainable=False):
     )
 
 
+def load_lora_for_inference(model, checkpoint_path):
+    """Load a checkpoint adapter as a frozen model ready for inference."""
+    model = load_lora_adapter(model, checkpoint_path, is_trainable=False)
+    model.requires_grad_(False)
+    model.eval()
+    return model
+
+
 def is_lora_model(model):
     """Return whether a model is wrapped in PEFT's LoRA model type."""
     return isinstance(model, PeftModel)

@@ -383,6 +383,22 @@ class OmniVoice(PreTrainedModel):
 
         return model
 
+    @classmethod
+    def from_lora_pretrained(cls, adapter_checkpoint, *args, **kwargs):
+        """Load a checkpointed LoRA adapter over its recorded base model."""
+        from omnivoice.training.lora import (
+            load_lora_for_inference,
+            read_lora_metadata,
+        )
+
+        metadata = read_lora_metadata(adapter_checkpoint)
+        base_model = cls.from_pretrained(
+            metadata["base_model_name_or_path"],
+            *args,
+            **kwargs,
+        )
+        return load_lora_for_inference(base_model, adapter_checkpoint)
+
     # -------------------------------------------------------------------
     # ASR support (optional, for auto-transcription)
     # -------------------------------------------------------------------
