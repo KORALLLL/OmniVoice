@@ -156,7 +156,7 @@ def test_select_records_reports_available_count(tmp_path):
         select_records(manifest, count=4, seed=42)
 
 
-def test_memorization_launcher_preserves_relative_source_path_across_repo_chdir(
+def test_memorization_launcher_preserves_relative_manifest_path_across_repo_chdir(
     tmp_path,
 ):
     source = tmp_path / "source.jsonl"
@@ -165,10 +165,9 @@ def test_memorization_launcher_preserves_relative_source_path_across_repo_chdir(
     bin_dir.mkdir()
     command_log = tmp_path / "commands.log"
 
-    for stub_name in ("python", "accelerate"):
-        stub = bin_dir / stub_name
-        stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$COMMAND_LOG"\n')
-        stub.chmod(0o755)
+    stub = bin_dir / "python"
+    stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$COMMAND_LOG"\n')
+    stub.chmod(0o755)
 
     result = subprocess.run(
         ["bash", str(ROOT / "examples/run_lora_memorization.sh")],
@@ -177,7 +176,7 @@ def test_memorization_launcher_preserves_relative_source_path_across_repo_chdir(
         | {
             "COMMAND_LOG": str(command_log),
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
-            "SOURCE_JSONL": source.name,
+            "SELECTED_MANIFEST": source.name,
         },
         capture_output=True,
         text=True,
@@ -185,6 +184,30 @@ def test_memorization_launcher_preserves_relative_source_path_across_repo_chdir(
     )
 
     assert result.returncode == 0, result.stderr
-    selector_command = shlex.split(command_log.read_text().splitlines()[0])
-    source_index = selector_command.index("--input-jsonl") + 1
-    assert selector_command[source_index] == str(source)
+    command = shlex.split(command_log.read_text().splitlines()[0])
+    manifest_index = command.index("--selected-manifest") + 1
+    assert command[manifest_index] == str(source)
+
+
+def test_memorization_example_config_uses_hard_number_limits():
+    config = json.loads(
+        (ROOT / "examples/config/train_config_lora_memorization.json").read_text()
+    )
+
+    assert config["steps"] == 10_000
+    assert config["eval_steps"] == 25
+    assert config["early_stop_eval_loss"] == 1e-4
+    assert config["early_stop_patience"] == 2
+    assert config["lora_rank"] == 64
+    assert set(config["lora_target_modules"]) >= {
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "embed_tokens",
+        "audio_embeddings",
+        "audio_heads",
+    }

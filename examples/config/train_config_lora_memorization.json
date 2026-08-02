@@ -30,7 +30,11 @@
     "learning_rate": 0.001,
     "weight_decay": 0.01,
     "max_grad_norm": 1.0,
-    "steps": 2000,
+    "steps": 10000,
+    "stop_after_step": 10000,
+    "max_wall_clock_seconds": 1200,
+    "early_stop_eval_loss": 0.0001,
+    "early_stop_patience": 2,
     "seed": 42,
     "warmup_type": "ratio",
     "warmup_ratio": 0.01,
@@ -45,8 +49,8 @@
     "allow_tf32": true,
     "attn_implementation": "sdpa",
 
-    "logging_steps": 50,
-    "eval_steps": 100,
-    "save_steps": 500,
+    "logging_steps": 25,
+    "eval_steps": 25,
+    "save_steps": 25,
     "keep_last_n_checkpoints": -1
 }

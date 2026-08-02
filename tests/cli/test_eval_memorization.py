@@ -4,7 +4,11 @@ import pytest
 import torch
 from torch import nn
 
-from omnivoice.cli.eval_memorization import check_memorization, mean_eval_loss
+from omnivoice.cli.eval_memorization import (
+    check_memorization,
+    check_memorization_patience,
+    mean_eval_loss,
+)
 
 
 class FakeModel(nn.Module):
@@ -23,6 +27,30 @@ def test_check_memorization_rejects_loss_above_threshold():
 def test_check_memorization_rejects_non_positive_threshold():
     with pytest.raises(ValueError, match="threshold must be positive"):
         check_memorization(loss=0.0, threshold=0.0)
+
+
+def test_check_memorization_patience_reports_second_consecutive_hit():
+    result = check_memorization_patience(
+        [(50, 2e-4), (75, 9e-5), (100, 8e-5)],
+        threshold=1e-4,
+        patience=2,
+    )
+
+    assert result.passed is True
+    assert result.qualifying_step == 100
+    assert result.minimum_loss == 8e-5
+
+
+def test_check_memorization_patience_resets_after_miss():
+    result = check_memorization_patience(
+        [(25, 9e-5), (50, 2e-4), (75, 8e-5)],
+        threshold=1e-4,
+        patience=2,
+    )
+
+    assert result.passed is False
+    assert result.qualifying_step is None
+    assert result.minimum_loss == 8e-5
 
 
 def test_mean_eval_loss_is_weighted_by_batch_count():

@@ -5,6 +5,7 @@ import argparse
 import json
 import random
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -13,11 +14,48 @@ from omnivoice.training.builder import build_dataloaders, build_model_and_tokeni
 from omnivoice.training.config import TrainingConfig
 
 
+@dataclass(frozen=True)
+class PatienceResult:
+    """Result of applying a consecutive-loss requirement."""
+
+    passed: bool
+    qualifying_step: int | None
+    minimum_loss: float | None
+
+
 def check_memorization(loss: float, threshold: float) -> int:
     """Return a process exit code for the configured memorization threshold."""
     if threshold <= 0:
         raise ValueError("threshold must be positive")
     return 0 if loss <= threshold else 1
+
+
+def check_memorization_patience(
+    evaluations: Iterable[tuple[int, float]],
+    *,
+    threshold: float,
+    patience: int,
+) -> PatienceResult:
+    """Return the first step satisfying a consecutive-loss requirement."""
+    if threshold <= 0:
+        raise ValueError("threshold must be positive")
+    if type(patience) is not int or patience <= 0:
+        raise ValueError("patience must be a positive integer")
+
+    consecutive_hits = 0
+    qualifying_step = None
+    minimum_loss = None
+    for step, loss in evaluations:
+        minimum_loss = loss if minimum_loss is None else min(minimum_loss, loss)
+        consecutive_hits = consecutive_hits + 1 if loss <= threshold else 0
+        if qualifying_step is None and consecutive_hits >= patience:
+            qualifying_step = step
+
+    return PatienceResult(
+        passed=qualifying_step is not None,
+        qualifying_step=qualifying_step,
+        minimum_loss=minimum_loss,
+    )
 
 
 def mean_eval_loss(
