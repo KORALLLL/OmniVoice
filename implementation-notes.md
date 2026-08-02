@@ -7,3 +7,5 @@
 - Tradeoff: Prefer 3–12 second references but permit clips over 12 seconds only as a deterministic fallback, with no hard upper limit.
 - Constraint: Initial real GPU work is one path with no automatic retry and one shared one-hour monotonic deadline.
 - Validation: Pre-implementation baseline passed 59 tests with six existing warnings in the worktree virtual environment; the system Python is not a valid test environment because it lacks the required Transformers API.
+- Decision: Keep GigaAM ONNX GPU and W&B dependencies in the `validation` optional extra so default OmniVoice installs remain unchanged.
+- Validation: Task 1 dependency test passed; `uv.lock` resolves the exact validation packages, and independent review approved the diff with no findings.
