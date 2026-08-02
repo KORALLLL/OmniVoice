@@ -8,8 +8,10 @@ import json
 import math
 import multiprocessing as mp
 import os
+import pickle
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -37,6 +39,7 @@ MAX_OPTIMIZER_STEPS = 10_000
 EVAL_STEPS = 25
 _CHECKPOINT_NAME = re.compile(r"^checkpoint-(\d+)$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_RELATIVE_PATH = re.compile(r"^(?P<shard>\d{6})/(?P<member>[^/]+\.mp3)$")
 _KNOWN_STOP_REASONS = {
     "completed",
     "eval_loss_target",
@@ -63,6 +66,109 @@ class MemorizationRunResult:
     training_outcome: TrainingOutcome
     experiment_deadline_monotonic: float
     miss_reason: str | None
+
+
+def _run_process_group(
+    command: Sequence[str],
+    *,
+    deadline_monotonic: float,
+    text: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run a command in a new process group and kill all descendants on timeout."""
+    process = subprocess.Popen(
+        list(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+        start_new_session=os.name == "posix",
+    )
+    try:
+        try:
+            stdout, stderr = process.communicate(
+                timeout=_remaining_seconds(deadline_monotonic, "subprocess")
+            )
+        except subprocess.TimeoutExpired as error:
+            _terminate_process_group(process)
+            raise subprocess.TimeoutExpired(
+                command,
+                error.timeout,
+                output=error.output,
+                stderr=error.stderr,
+            ) from None
+        completed = subprocess.CompletedProcess(
+            list(command), process.returncode, stdout, stderr
+        )
+        if process.returncode:
+            raise subprocess.CalledProcessError(
+                process.returncode,
+                list(command),
+                output=stdout,
+                stderr=stderr,
+            )
+        return completed
+    finally:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
+def _signal_process_group(process: subprocess.Popen, signal_number: int) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal_number)
+        elif signal_number == signal.SIGTERM:
+            process.terminate()
+        else:
+            process.kill()
+    except ProcessLookupError:
+        pass
+
+
+def _process_group_exists(process: subprocess.Popen) -> bool:
+    if os.name != "posix":
+        return process.poll() is None
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _terminate_process_group(process: subprocess.Popen) -> None:
+    _signal_process_group(process, signal.SIGTERM)
+    try:
+        process.communicate(timeout=_TERMINATE_JOIN_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    if _process_group_exists(process):
+        _signal_process_group(process, signal.SIGKILL)
+    try:
+        process.communicate(timeout=_TERMINATE_JOIN_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("subprocess group did not terminate after SIGKILL") from error
+
+
+def _invoke_command(
+    command: Sequence[str],
+    *,
+    deadline_monotonic: float,
+    command_runner: CommandRunner | None,
+    capture_output: bool = False,
+    text: bool = False,
+) -> Any:
+    if command_runner is None or command_runner is subprocess.run:
+        return _run_process_group(
+            command,
+            deadline_monotonic=deadline_monotonic,
+            text=text,
+        )
+    return command_runner(
+        list(command),
+        check=True,
+        capture_output=capture_output,
+        text=text,
+        timeout=_remaining_seconds(deadline_monotonic, "subprocess"),
+    )
 
 
 def _clip_id(row: SelectedBalalaikaClip, index: int) -> str:
@@ -208,7 +314,13 @@ def _run_generation_bounded(
 ) -> list[Path]:
     """Generate in a terminable child process under the phase deadline."""
     _remaining_seconds(deadline_monotonic, "generation")
-    context = mp.get_context("spawn")
+    try:
+        pickle.dumps(model_loader)
+    except (AttributeError, pickle.PicklingError, TypeError):
+        method = "fork" if os.name == "posix" else "spawn"
+    else:
+        method = "spawn"
+    context = mp.get_context(method)
     parent_connection, child_connection = context.Pipe(duplex=False)
     kwargs = {
         "rows": rows,
@@ -217,14 +329,17 @@ def _run_generation_bounded(
         "base_model": base_model,
         "adapter_checkpoint": adapter_checkpoint,
     }
-    process = context.Process(
-        target=_generation_child,
-        args=(child_connection, kwargs),
-        daemon=False,
-    )
-    process.start()
-    child_connection.close()
+    process = None
+    started = False
     try:
+        process = context.Process(
+            target=_generation_child,
+            args=(child_connection, kwargs),
+            daemon=False,
+        )
+        process.start()
+        started = True
+        child_connection.close()
         process.join(_remaining_seconds(deadline_monotonic, "generation"))
         if process.is_alive():
             _stop_child(process)
@@ -237,7 +352,8 @@ def _run_generation_bounded(
         if not succeeded:
             raise RuntimeError(f"generation child failed: {message}")
     finally:
-        if process.is_alive():
+        child_connection.close()
+        if started and process is not None and process.is_alive():
             _stop_child(process)
         parent_connection.close()
     _remaining_seconds(deadline_monotonic, "generation completion")
@@ -369,15 +485,57 @@ def _read_selected_rows(path: Path) -> list[SelectedBalalaikaClip]:
                 rows.append(row)
     if len(rows) != 4:
         raise ValueError(f"expected exactly four memorization rows, got {len(rows)}")
+    for row in rows:
+        if (
+            not isinstance(row.source_relative_path, str)
+            or not row.source_relative_path.strip()
+        ):
+            raise ValueError("source_relative_path must be nonempty")
+        if type(row.schema_version) is not int or row.schema_version <= 0:
+            raise ValueError("schema_version must be a positive integer")
+        if row.role != "memorization":
+            raise ValueError("role must be memorization")
+        if row.duration_tier not in {
+            "preferred_3_to_12s",
+            "fallback_over_12s",
+        }:
+            raise ValueError("duration_tier is invalid")
+        if type(row.sample_rate) is not int or row.sample_rate != 24_000:
+            raise ValueError("sample_rate must be exactly 24000")
+        if type(row.channels) is not int or row.channels != 1:
+            raise ValueError("channels must be exactly 1")
+        if type(row.seed) is not int:
+            raise ValueError("seed must be an integer")
+        if not isinstance(row.source_shard, str) or not row.source_shard.strip():
+            raise ValueError("source_shard must be nonempty")
+        if not isinstance(row.member_name, str) or not row.member_name.strip():
+            raise ValueError("member_name must be nonempty")
+        source_match = _SOURCE_RELATIVE_PATH.fullmatch(row.source_relative_path)
+        if source_match is None:
+            raise ValueError("source_relative_path has an invalid format")
+        expected_shard = f"train/shard_{source_match.group('shard')}.tar"
+        if row.source_shard != expected_shard:
+            raise ValueError("source_shard does not match source_relative_path")
+        if row.member_name != source_match.group("member"):
+            raise ValueError("member_name does not match source_relative_path")
+    schema_versions = [row.schema_version for row in rows]
     source_paths = [row.source_relative_path for row in rows]
+    member_names = [row.member_name for row in rows]
     audio_paths = [str(Path(row.audio_path).resolve()) for row in rows]
     artifact_ids = [_clip_id(row, index) for index, row in enumerate(rows)]
+    source_hashes = [row.source_sha256 for row in rows]
+    wav_hashes = [row.wav_sha256 for row in rows]
+    if len(set(schema_versions)) != 1:
+        raise ValueError("schema_version must be consistent across selected rows")
     if (
         len(set(source_paths)) != 4
+        or len(set(member_names)) != 4
         or len(set(audio_paths)) != 4
         or len(set(artifact_ids)) != 4
+        or len(set(source_hashes)) != 4
+        or len(set(wav_hashes)) != 4
     ):
-        raise ValueError("memorization rows must have unique IDs and source paths")
+        raise ValueError("memorization rows must have unique IDs, paths, and hashes")
     for row in rows:
         if not isinstance(row.text, str) or not row.text.strip():
             raise ValueError("memorization text must be nonempty")
@@ -400,6 +558,12 @@ def _read_selected_rows(path: Path) -> list[SelectedBalalaikaClip]:
             or abs(float(row.duration) - actual_duration) > 1 / info.samplerate
         ):
             raise ValueError("selected WAV duration metadata is invalid")
+        if row.duration_tier == "preferred_3_to_12s" and not (
+            3.0 <= actual_duration <= 12.0
+        ):
+            raise ValueError("duration_tier does not match WAV duration")
+        if row.duration_tier == "fallback_over_12s" and actual_duration <= 12.0:
+            raise ValueError("duration_tier does not match WAV duration")
         if _sha256_file(audio_path) != row.wav_sha256:
             raise ValueError("selected WAV hash does not match wav_sha256")
     return rows
@@ -438,8 +602,19 @@ def _copy_originals(
         _remaining_seconds(deadline, "original audio copy")
         destination = output_dir / f"{_clip_id(row, index)}.wav"
         shutil.copy2(row.audio_path, destination)
+        if _sha256_file(destination) != row.wav_sha256:
+            raise ValueError(f"copied original hash mismatch: {destination}")
         originals.append(destination)
     return _validate_wav_set(rows, output_dir, label="original")
+
+
+def _validate_original_hashes(
+    rows: Sequence[SelectedBalalaikaClip], output_dir: Path
+) -> None:
+    for index, row in enumerate(rows):
+        path = output_dir / f"{_clip_id(row, index)}.wav"
+        if _sha256_file(path) != row.wav_sha256:
+            raise ValueError(f"copied original hash mismatch: {path}")
 
 
 def _write_training_manifest(
@@ -627,6 +802,20 @@ def _validate_run_consistency(
     outcome: TrainingOutcome,
     history: Sequence[Mapping[str, int | float]],
 ):
+    actual_steps = [int(row["step"]) for row in history]
+    expected_steps = list(range(EVAL_STEPS, outcome.step + 1, EVAL_STEPS))
+    if actual_steps != expected_steps:
+        raise ValueError(
+            "loss history must evaluate exactly every 25 steps from step 25 "
+            f"through {outcome.step}"
+        )
+    if (
+        outcome.stop_reason in {"completed", "stop_after_step"}
+        and outcome.step != MAX_OPTIMIZER_STEPS
+    ):
+        raise ValueError(
+            f"{outcome.stop_reason} is valid only at step {MAX_OPTIMIZER_STEPS}"
+        )
     final = history[-1]
     if outcome.step != final["step"] or not math.isclose(
         float(outcome.last_eval_loss),
@@ -695,6 +884,7 @@ def _validate_artifact_bundle(
     stage: Path, rows: Sequence[SelectedBalalaikaClip]
 ) -> None:
     _validate_wav_set(rows, stage / "original", label="original")
+    _validate_original_hashes(rows, stage / "original")
     _validate_wav_set(rows, stage / "generated/initial", label="generated initial")
     _validate_wav_set(rows, stage / "generated/final", label="generated final")
     if len((stage / "four.jsonl").read_text(encoding="utf-8").splitlines()) != 4:
@@ -721,7 +911,7 @@ def run_memorization(
     data_config: str | Path,
     max_wall_clock_seconds: float = 1200,
     experiment_wall_clock_seconds: float = 3600,
-    command_runner: CommandRunner = subprocess.run,
+    command_runner: CommandRunner | None = None,
     model_loader: ModelLoader = _default_model_loader,
     generation_runner: GenerationRunner = _run_generation_bounded,
 ) -> MemorizationRunResult:
@@ -760,10 +950,10 @@ def run_memorization(
         )
         _remaining_seconds(phase_deadline, "tokenization")
         token_dir = output_path / "tokens"
-        command_runner(
+        _invoke_command(
             _tokenizer_command(training_manifest, token_dir),
-            check=True,
-            timeout=_remaining_seconds(phase_deadline, "tokenization"),
+            deadline_monotonic=phase_deadline,
+            command_runner=command_runner,
         )
 
         runtime_data_config = output_path / "data_config.json"
@@ -780,12 +970,12 @@ def run_memorization(
             history_path=history_path,
             remaining_wall_clock_seconds=remaining,
         )
-        completed = command_runner(
+        completed = _invoke_command(
             _training_command(runtime_train_config, runtime_data_config, output_path),
-            check=True,
+            deadline_monotonic=phase_deadline,
+            command_runner=command_runner,
             capture_output=True,
             text=True,
-            timeout=_remaining_seconds(phase_deadline, "training"),
         )
         outcome = _parse_training_outcome(completed.stdout)
         history = read_loss_history(history_path)

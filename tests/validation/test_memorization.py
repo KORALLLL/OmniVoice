@@ -1,6 +1,9 @@
 import hashlib
 import json
+import os
+import signal
 import subprocess
+import sys
 import time
 import weakref
 from dataclasses import asdict
@@ -17,6 +20,9 @@ from omnivoice.validation.balalaika import SelectedBalalaikaClip
 from omnivoice.validation.memorization import (
     _generate_with_model_loader,
     _parse_training_outcome,
+    _run_generation_bounded,
+    _run_process_group,
+    _validate_run_consistency,
     choose_generation_checkpoint,
     generate_four,
     read_loss_history,
@@ -32,7 +38,12 @@ def _selected_manifest(tmp_path: Path) -> tuple[Path, list[SelectedBalalaikaClip
     rows = []
     for index in range(4):
         audio_path = tmp_path / f"source-{index}.wav"
-        sf.write(audio_path, np.zeros(240, dtype=np.float32), 24_000, subtype="PCM_16")
+        sf.write(
+            audio_path,
+            np.full(72_000, index / 100.0, dtype=np.float32),
+            24_000,
+            subtype="PCM_16",
+        )
         rows.append(
             SelectedBalalaikaClip(
                 role="memorization",
@@ -47,7 +58,7 @@ def _selected_manifest(tmp_path: Path) -> tuple[Path, list[SelectedBalalaikaClip
                 wav_sha256=_sha256(audio_path),
                 sample_rate=24_000,
                 channels=1,
-                duration=0.01,
+                duration=3.0,
                 duration_tier="preferred_3_to_12s",
             )
         )
@@ -184,7 +195,8 @@ def _fake_dependencies(output_dir: Path, losses: list[float], stop_reason: str):
     def command_runner(command, **kwargs):
         commands.append((command, kwargs))
         if "omnivoice.cli.train" in command:
-            for step, loss in zip((50, 75, 100), losses):
+            history = [(25, 3e-4), *zip((50, 75, 100), losses)]
+            for step, loss in history:
                 append_loss_history(
                     output_dir / "loss_history.jsonl",
                     step=step,
@@ -447,7 +459,8 @@ def test_run_requires_exact_current_checkpoint(tmp_path, target_reached):
         del kwargs
         if "omnivoice.cli.train" not in command:
             return SimpleNamespace(stdout="")
-        for step, loss in zip((50, 75, 100), losses):
+        history = [(25, 3e-4), *zip((50, 75, 100), losses)]
+        for step, loss in history:
             append_loss_history(
                 output_dir / "loss_history.jsonl",
                 step=step,
@@ -712,3 +725,223 @@ def test_read_loss_history_rejects_nonfinite_or_inconsistent_rows(tmp_path, rows
 def test_parse_training_outcome_rejects_malformed_schema(payload):
     with pytest.raises(ValueError, match="TrainingOutcome"):
         _parse_training_outcome(json.dumps(payload))
+
+
+def test_process_group_timeout_kills_pipe_holding_grandchild(tmp_path):
+    marker = tmp_path / "late-marker"
+    pgid_file = tmp_path / "pgid"
+    child_code = (
+        "import signal,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(0.8); Path(__import__('sys').argv[1]).write_text('late')"
+    )
+    launcher_code = (
+        "import os,subprocess,sys,time; "
+        "open(sys.argv[1], 'w').write(str(os.getpgrp())); "
+        "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[3]]); "
+        "time.sleep(10)"
+    )
+    started = time.monotonic()
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_process_group(
+            [sys.executable, "-c", launcher_code, str(pgid_file), child_code, str(marker)],
+            deadline_monotonic=time.monotonic() + 0.2,
+            text=True,
+        )
+
+    assert time.monotonic() - started < 1.5
+    time.sleep(1.0)
+    assert not marker.exists()
+    process_group = int(pgid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.killpg(process_group, 0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("source_relative_path", " ", "source_relative_path"),
+        ("schema_version", True, "schema_version"),
+        ("schema_version", 2, "schema_version"),
+        ("duration_tier", "wrong", "duration_tier"),
+        ("sample_rate", True, "sample_rate"),
+        ("channels", 2, "channels"),
+    ],
+)
+def test_selected_manifest_rejects_invalid_consumed_metadata(
+    tmp_path, field, value, message
+):
+    manifest, rows = _selected_manifest(tmp_path)
+    rows[0] = SelectedBalalaikaClip(**(asdict(rows[0]) | {field: value}))
+    _rewrite_manifest(manifest, rows)
+    train_config, data_config = _write_configs(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        run_memorization(
+            selected_manifest=manifest,
+            output_dir=tmp_path / "exp",
+            train_config=train_config,
+            data_config=data_config,
+            command_runner=lambda *args, **kwargs: None,
+            model_loader=lambda **kwargs: FakeModel([]),
+            generation_runner=_direct_generation_runner,
+        )
+
+
+@pytest.mark.parametrize("hash_field", ["source_sha256", "wav_sha256"])
+def test_selected_manifest_rejects_duplicate_recorded_hashes(tmp_path, hash_field):
+    manifest, rows = _selected_manifest(tmp_path)
+    updates = {hash_field: getattr(rows[0], hash_field)}
+    if hash_field == "wav_sha256":
+        first_bytes = Path(rows[0].audio_path).read_bytes()
+        Path(rows[1].audio_path).write_bytes(first_bytes)
+        updates["duration"] = rows[0].duration
+    rows[1] = SelectedBalalaikaClip(**(asdict(rows[1]) | updates))
+    _rewrite_manifest(manifest, rows)
+    train_config, data_config = _write_configs(tmp_path)
+
+    with pytest.raises(ValueError, match="unique.*hash"):
+        run_memorization(
+            selected_manifest=manifest,
+            output_dir=tmp_path / "exp",
+            train_config=train_config,
+            data_config=data_config,
+            command_runner=lambda *args, **kwargs: None,
+            model_loader=lambda **kwargs: FakeModel([]),
+            generation_runner=_direct_generation_runner,
+        )
+
+
+def test_copy_corruption_is_detected_before_publication(tmp_path, monkeypatch):
+    manifest, _ = _selected_manifest(tmp_path)
+    train_config, data_config = _write_configs(tmp_path)
+    output_dir = tmp_path / "exp"
+    before = _seed_published_artifacts(output_dir)
+    real_copy = __import__("shutil").copy2
+
+    def corrupting_copy(source, destination):
+        result = real_copy(source, destination)
+        with Path(destination).open("ab") as output:
+            output.write(b"corruption")
+        return result
+
+    monkeypatch.setattr(
+        "omnivoice.validation.memorization.shutil.copy2", corrupting_copy
+    )
+    with pytest.raises(ValueError, match="copied original hash"):
+        run_memorization(
+            selected_manifest=manifest,
+            output_dir=output_dir,
+            train_config=train_config,
+            data_config=data_config,
+            command_runner=lambda *args, **kwargs: None,
+            model_loader=lambda **kwargs: FakeModel([]),
+            generation_runner=_direct_generation_runner,
+        )
+
+    assert _published_snapshot(output_dir) == before
+
+
+@pytest.mark.parametrize(
+    ("steps", "outcome", "message"),
+    [
+        (
+            [50, 75, 100],
+            TrainingOutcome(100, "wall_clock_limit", 2e-4, False),
+            "exactly every 25",
+        ),
+        (
+            [25, 75, 100],
+            TrainingOutcome(100, "wall_clock_limit", 2e-4, False),
+            "exactly every 25",
+        ),
+        (
+            [25, 50, 75],
+            TrainingOutcome(75, "completed", 2e-4, False),
+            "step 10000",
+        ),
+        (
+            [25, 50, 75],
+            TrainingOutcome(75, "stop_after_step", 2e-4, False),
+            "step 10000",
+        ),
+    ],
+)
+def test_run_consistency_rejects_missing_evals_or_wrong_terminal(
+    steps, outcome, message
+):
+    history = [
+        {"step": step, "loss": 2e-4, "elapsed_seconds": float(step)}
+        for step in steps
+    ]
+
+    with pytest.raises(ValueError, match=message):
+        _validate_run_consistency(outcome, history)
+
+
+@pytest.mark.filterwarnings("ignore:This process.*use of fork")
+def test_bounded_generation_accepts_local_injected_loader(tmp_path):
+    _, rows = _selected_manifest(tmp_path)
+
+    def local_loader(*, base_model=None, adapter_checkpoint=None):
+        del base_model, adapter_checkpoint
+        return FakeModel([])
+
+    generated = _run_generation_bounded(
+        rows=rows,
+        output_dir=tmp_path / "generated",
+        model_loader=local_loader,
+        base_model="k2-fsa/OmniVoice",
+        adapter_checkpoint=None,
+        deadline_monotonic=time.monotonic() + 5,
+    )
+
+    assert len(generated) == 4
+
+
+def test_generation_start_failure_closes_pipe_endpoints(tmp_path, monkeypatch):
+    _, rows = _selected_manifest(tmp_path)
+
+    class FakeConnection:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeProcess:
+        pid = None
+
+        def start(self):
+            raise OSError("start failed")
+
+    parent_connection = FakeConnection()
+    child_connection = FakeConnection()
+
+    class FakeContext:
+        def Pipe(self, *, duplex):
+            assert duplex is False
+            return parent_connection, child_connection
+
+        def Process(self, **kwargs):
+            del kwargs
+            return FakeProcess()
+
+    monkeypatch.setattr(
+        "omnivoice.validation.memorization.mp.get_context",
+        lambda method: FakeContext(),
+    )
+
+    with pytest.raises(OSError, match="start failed"):
+        _run_generation_bounded(
+            rows=rows,
+            output_dir=tmp_path / "generated",
+            model_loader=lambda **kwargs: FakeModel([]),
+            base_model="k2-fsa/OmniVoice",
+            adapter_checkpoint=None,
+            deadline_monotonic=time.monotonic() + 5,
+        )
+
+    assert parent_connection.closed is True
+    assert child_connection.closed is True
