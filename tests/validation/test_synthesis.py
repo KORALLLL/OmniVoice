@@ -15,7 +15,8 @@ import pytest
 import soundfile as sf
 import torch
 
-from omnivoice.validation.artifacts import AtomicJsonlLedger
+from omnivoice.cli.validate_hard_numbers import INCOMPLETE_EXIT_CODE, _run_synth
+from omnivoice.validation.artifacts import AtomicJsonlLedger, ValidationPaths
 from omnivoice.validation.balalaika import SelectedBalalaikaClip
 from omnivoice.validation.hard_numbers import (
     HardNumberRow,
@@ -30,6 +31,7 @@ from omnivoice.validation.synthesis import (
     fingerprint_adapter_checkpoint,
     load_assignment_manifest,
     load_validation_tts,
+    read_synthesis_summary,
     resolve_distributed_context,
     resolve_model_source,
     run_bounded,
@@ -210,6 +212,67 @@ def test_synthesize_exact_stride_caches_prompts_and_resumes_valid_hashes(
     )
     assert (repaired.generated, repaired.skipped, repaired.completed) == (1, 249, 250)
     assert len(repair_model.generate_calls) == 1
+
+
+def test_cli_owned_normal_summary_records_context_and_reuses_valid_counts(
+    assignments, tmp_path: Path
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="normal-cli-run",
+        step=37,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=0.0,
+    )
+    source = _source_identity(assignments)
+    common = {
+        "assignment_loader": lambda path: assignments,
+        "context_resolver": lambda: DistributedContext(0, 0, 8),
+        "source_resolver": lambda **kwargs: source,
+        "distributed_initializer": lambda context: None,
+        "synchronizer": lambda: True,
+        "cuda_releaser": lambda: None,
+        "output": lambda payload: None,
+    }
+
+    code = _run_synth(
+        args,
+        model_loader=lambda **kwargs: FakeModel(),
+        **common,
+    )
+
+    assert code == INCOMPLETE_EXIT_CODE
+    paths = ValidationPaths(tmp_path, args.run_id, args.step)
+    durable = read_synthesis_summary(paths, rank=0)
+    assert (durable.run_id, durable.step) == (args.run_id, args.step)
+    assert (
+        durable.expected,
+        durable.completed,
+        durable.generated,
+        durable.skipped,
+        durable.failed,
+    ) == (250, 0, 0, 0, 0)
+
+    with pytest.raises(ValueError, match="same context load exploded"):
+        _run_synth(
+            args,
+            model_loader=lambda **kwargs: (_ for _ in ()).throw(
+                ValueError("same context load exploded")
+            ),
+            **common,
+        )
+
+    reused = read_synthesis_summary(paths, rank=0)
+    assert (
+        reused.expected,
+        reused.completed,
+        reused.generated,
+        reused.skipped,
+        reused.failed,
+    ) == (250, 0, 0, 0, 0)
+    assert reused.primary_error.message == "same context load exploded"
 
 
 @pytest.mark.parametrize(

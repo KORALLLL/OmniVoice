@@ -19,6 +19,7 @@ from omnivoice.cli.validate_hard_numbers import (
     _run_synth,
     build_parser,
 )
+from omnivoice.validation.artifacts import ValidationPaths
 from omnivoice.validation.synthesis import (
     DistributedContext,
     ModelSourceIdentity,
@@ -144,7 +145,7 @@ def test_run_synth_forwards_source_and_returns_distinct_incomplete_code(
     assert calls["loader"]["source_identity"] == source_identity
     assert calls["loader"]["context"] == context
     assert calls["synthesizer"]["source_identity"] == source_identity
-    assert calls["synthesizer"]["output_dir"] == tmp_path / "run-1" / "step-625"
+    assert calls["synthesizer"]["output_dir"] == ValidationPaths(tmp_path, "run-1", 625)
     assert synchronized == [True]
     assert released == [True]
 
@@ -1306,6 +1307,79 @@ def test_exact_same_source_prior_summary_reuses_known_counts(tmp_path: Path) -> 
     assert (durable.expected, durable.completed, durable.generated) == (250, 123, 123)
     assert durable.source_identity == source
     assert durable.primary_error.message == "same source load exploded"
+
+
+@pytest.mark.parametrize(
+    ("expected", "completed", "generated", "skipped", "failed"),
+    [
+        pytest.param(250, None, 999, 999, 999, id="unknown-completed-with-counts"),
+        pytest.param(None, 999, None, None, None, id="unknown-expected-with-count"),
+        pytest.param(250, 249, 249, 0, 250, id="completed-plus-failed"),
+        pytest.param(250, 100, None, 100, 0, id="mixed-null-and-known"),
+        pytest.param(-1, None, None, None, None, id="negative-expected"),
+        pytest.param(250, 0, 0, 0, -1, id="negative-failed"),
+        pytest.param(250, True, True, 0, 0, id="boolean-count"),
+        pytest.param(True, None, None, None, None, id="boolean-expected"),
+        pytest.param(250, 250, 250, 0, 251, id="over-expected-failed"),
+    ],
+)
+def test_impossible_summary_counts_are_not_reused_for_current_fallback(
+    tmp_path: Path,
+    expected: int | None,
+    completed: int | None,
+    generated: int | None,
+    skipped: int | None,
+    failed: int | None,
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="current-counts",
+        step=24,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source = _source_identity(tmp_path)
+    prior = SynthesisSummary(
+        rank=0,
+        expected=expected,
+        completed=completed,
+        generated=generated,
+        skipped=skipped,
+        failed=failed,
+        complete=False,
+        stop_reason="deadline",
+        source_identity=source,
+        run_id=args.run_id,
+        step=args.step,
+    )
+    write_synthesis_summary(tmp_path / args.run_id / "step-24", prior)
+
+    with pytest.raises(ValueError, match="current load exploded"):
+        _run_synth(
+            args,
+            assignment_loader=lambda path: [object()] * 2_000,
+            context_resolver=lambda: DistributedContext(0, 0, 8),
+            source_resolver=lambda **kwargs: source,
+            distributed_initializer=lambda context: None,
+            model_loader=lambda **kwargs: (_ for _ in ()).throw(
+                ValueError("current load exploded")
+            ),
+            synthesizer=lambda **kwargs: None,
+            synchronizer=lambda: True,
+            cuda_releaser=lambda: None,
+        )
+
+    durable = read_synthesis_summary(tmp_path / "current-counts" / "step-24", rank=0)
+    assert (
+        durable.expected,
+        durable.completed,
+        durable.generated,
+        durable.skipped,
+        durable.failed,
+    ) == (250, None, None, None, None)
+    assert durable.primary_error.message == "current load exploded"
 
 
 @pytest.mark.parametrize("stale_field", ["run_id", "step", "rank", "malformed"])

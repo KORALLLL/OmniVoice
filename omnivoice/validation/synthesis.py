@@ -763,6 +763,8 @@ def synthesize_rank(
             f"rank {rank} must receive exactly {RANK_ASSIGNMENT_COUNT} assignments"
         )
 
+    run_id = output_dir.run_id if isinstance(output_dir, ValidationPaths) else None
+    step = output_dir.step if isinstance(output_dir, ValidationPaths) else None
     step_dir = _step_directory(output_dir)
     wav_dir = step_dir / "wavs"
     ledger_path = step_dir / "rank-manifests" / f"rank-{rank}.jsonl"
@@ -871,6 +873,8 @@ def synthesize_rank(
         complete=complete,
         stop_reason=stop_reason,
         source_identity=source_identity,
+        run_id=run_id,
+        step=step,
     )
     _atomic_write_summary(summary_path, summary)
     return summary

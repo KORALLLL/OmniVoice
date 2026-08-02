@@ -114,33 +114,30 @@ def _summary_matches_current_context(
         )
     ):
         return False
-    counts = (
-        summary.expected,
+    expected = summary.expected
+    progress_counts = (
         summary.completed,
         summary.generated,
         summary.skipped,
         summary.failed,
     )
-    if any(
-        value is not None and (type(value) is not int or value < 0) for value in counts
-    ):
+    if expected is None:
+        if any(value is not None for value in progress_counts):
+            return False
+    elif type(expected) is not int or expected < 0:
         return False
-    if (
-        summary.expected is not None
-        and summary.completed is not None
-        and summary.completed > summary.expected
-    ):
-        return False
-    if (
-        summary.completed is not None
-        and summary.generated is not None
-        and summary.skipped is not None
-        and summary.generated + summary.skipped != summary.completed
-    ):
-        return False
+    elif not all(value is None for value in progress_counts):
+        if any(
+            type(value) is not int or not 0 <= value <= expected
+            for value in progress_counts
+        ):
+            return False
+        completed, generated, skipped, failed = progress_counts
+        if generated + skipped != completed or completed + failed > expected:
+            return False
     return not summary.complete or (
-        summary.expected is not None
-        and summary.completed == summary.expected
+        expected is not None
+        and summary.completed == expected
         and summary.failed == 0
         and summary.error is None
         and summary.primary_error is None
@@ -270,13 +267,14 @@ def _run_synth(
             summary = synthesizer(
                 assignments=assignments,
                 model=model_holder[0],
-                output_dir=paths.step_dir,
+                output_dir=paths,
                 rank=context.rank,
                 world_size=context.world_size,
                 source_identity=source_identity,
                 deadline_monotonic=args.deadline_monotonic,
                 stop_requested=stop_requested,
             )
+            summary = replace(summary, run_id=args.run_id, step=args.step)
         except BaseException as error:  # noqa: BLE001 - cleanup must still run
             primary_error = error
             primary_traceback = error.__traceback__
@@ -365,8 +363,8 @@ def _run_synth(
                 complete=False,
                 stop_reason=stage,
                 error=detail,
-                run_id=summary.run_id or args.run_id,
-                step=summary.step if summary.step is not None else args.step,
+                run_id=args.run_id,
+                step=args.step,
                 cleanup_error=detail,
             )
             summary_writer(paths.step_dir, summary)
@@ -465,6 +463,8 @@ def _run_synth(
                         if interrupted
                         else summary.stop_reason or "synchronization"
                     ),
+                    run_id=args.run_id,
+                    step=args.step,
                 )
                 summary_writer(paths.step_dir, summary)
 
