@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -19,6 +20,7 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 import torch
+from huggingface_hub import snapshot_download
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.validation.artifacts import AtomicJsonlLedger, ValidationPaths
@@ -34,6 +36,7 @@ FULL_VALIDATION_WORLD_SIZE = 8
 RANK_ASSIGNMENT_COUNT = HARD_NUMBER_COUNT // FULL_VALIDATION_WORLD_SIZE
 SAMPLE_RATE = 24_000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_HUB_COMMIT = re.compile(r"^[0-9a-f]{40,64}$")
 
 GENERATION_CONFIG = OmniVoiceGenerationConfig(
     num_step=32,
@@ -53,6 +56,32 @@ class DistributedContext:
 
 
 @dataclass(frozen=True)
+class ModelSourceIdentity:
+    """A validated immutable model load target and its stable identity."""
+
+    kind: str
+    requested: str
+    load_path: str
+    immutable_id: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"base", "adapter"}:
+            raise ValueError("model source kind must be 'base' or 'adapter'")
+        if not isinstance(self.requested, str) or not self.requested.strip():
+            raise ValueError("requested model source must be a non-blank string")
+        load_path = Path(self.load_path)
+        if not load_path.is_dir() or str(load_path.resolve()) != self.load_path:
+            raise ValueError("model source load_path must be a resolved directory")
+        expected_prefix = "hf:" if self.kind == "base" else "sha256:"
+        digest = self.immutable_id.removeprefix(expected_prefix)
+        pattern = _HUB_COMMIT if self.kind == "base" else _SHA256
+        if not self.immutable_id.startswith(expected_prefix) or not pattern.fullmatch(
+            digest
+        ):
+            raise ValueError("model source immutable_id is malformed")
+
+
+@dataclass(frozen=True)
 class SynthesisSummary:
     rank: int
     expected: int
@@ -62,6 +91,101 @@ class SynthesisSummary:
     failed: int
     complete: bool
     stop_reason: str | None
+    source_identity: ModelSourceIdentity
+
+
+def _adapter_checkpoint_root(checkpoint_path: str | Path) -> Path:
+    from omnivoice.training.lora import (
+        _validate_adapter_config,
+        read_lora_metadata,
+        resolve_adapter_dir,
+    )
+
+    checkpoint_root, adapter_dir = resolve_adapter_dir(checkpoint_path)
+    checkpoint_root = checkpoint_root.resolve()
+    adapter_dir = adapter_dir.resolve()
+    metadata = read_lora_metadata(checkpoint_root)
+    if not (adapter_dir / "adapter_config.json").is_file():
+        raise FileNotFoundError("LoRA adapter_config.json is missing")
+    if not any(
+        (adapter_dir / filename).is_file()
+        for filename in ("adapter_model.safetensors", "adapter_model.bin")
+    ):
+        raise FileNotFoundError("LoRA adapter weights are missing")
+    _validate_adapter_config(adapter_dir, metadata)
+    return checkpoint_root
+
+
+def fingerprint_adapter_checkpoint(checkpoint_path: str | Path) -> str:
+    """Hash a canonical recursive manifest of every checkpoint regular file."""
+    checkpoint_root = _adapter_checkpoint_root(checkpoint_path)
+    manifest: list[dict[str, Any]] = []
+    for path in sorted(checkpoint_root.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(checkpoint_root).as_posix()
+        metadata = path.stat(follow_symlinks=False)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"LoRA checkpoint may not contain symlinks: {relative}")
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(
+                f"LoRA checkpoint may contain only regular files: {relative}"
+            )
+        manifest.append(
+            {
+                "path": relative,
+                "sha256": _sha256_file(path),
+                "size": metadata.st_size,
+            }
+        )
+    if not manifest:
+        raise ValueError("LoRA checkpoint contains no regular files")
+    canonical = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def resolve_model_source(
+    *,
+    model_name: str | None = None,
+    adapter_checkpoint: str | Path | None = None,
+    snapshot_resolver: Callable[..., str | Path] = snapshot_download,
+    adapter_fingerprinter: Callable[[str | Path], str] = fingerprint_adapter_checkpoint,
+) -> ModelSourceIdentity:
+    """Resolve a requested base or adapter into an immutable load identity."""
+    if (model_name is None) == (adapter_checkpoint is None):
+        raise ValueError("specify exactly one of model_name or adapter_checkpoint")
+    if model_name is not None:
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError("model_name must be a non-blank string")
+        snapshot = Path(snapshot_resolver(repo_id=model_name)).resolve()
+        if not snapshot.is_dir() or not _HUB_COMMIT.fullmatch(snapshot.name):
+            raise ValueError(
+                "base model did not resolve to an immutable Hub snapshot directory"
+            )
+        return ModelSourceIdentity(
+            kind="base",
+            requested=model_name,
+            load_path=str(snapshot),
+            immutable_id=f"hf:{snapshot.name}",
+        )
+
+    requested = str(adapter_checkpoint)
+    checkpoint_root = _adapter_checkpoint_root(adapter_checkpoint)
+    digest = adapter_fingerprinter(checkpoint_root)
+    if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+        raise ValueError("adapter fingerprinter must return a lowercase SHA-256")
+    return ModelSourceIdentity(
+        kind="adapter",
+        requested=requested,
+        load_path=str(checkpoint_root),
+        immutable_id=f"sha256:{digest}",
+    )
 
 
 class _StrictJsonError(ValueError):
@@ -169,23 +293,24 @@ def resolve_distributed_context(
 def load_validation_tts(
     *,
     context: DistributedContext,
-    model_name: str | None = None,
-    adapter_checkpoint: str | Path | None = None,
+    source_identity: ModelSourceIdentity,
     model_class: Any = OmniVoice,
     torch_module: Any = torch,
+    adapter_fingerprinter: Callable[[str | Path], str] = fingerprint_adapter_checkpoint,
 ) -> Any:
     """Bind one CUDA device and load exactly one base or LoRA model in FP16."""
     if context.world_size != FULL_VALIDATION_WORLD_SIZE:
         raise ValueError("validation TTS requires exactly eight ranks")
-    if (model_name is None) == (adapter_checkpoint is None):
-        raise ValueError("specify exactly one of model_name or adapter_checkpoint")
-    if model_name is not None and (
-        not isinstance(model_name, str) or not model_name.strip()
-    ):
-        raise ValueError("model_name must be a non-blank string")
-    checkpoint = None if adapter_checkpoint is None else Path(adapter_checkpoint)
-    if checkpoint is not None and not checkpoint.is_dir():
-        raise FileNotFoundError(f"adapter checkpoint directory does not exist: {checkpoint}")
+    if not isinstance(source_identity, ModelSourceIdentity):
+        raise TypeError("source_identity must be a ModelSourceIdentity")
+    load_path = Path(source_identity.load_path)
+    if source_identity.kind == "base":
+        if source_identity.immutable_id != f"hf:{load_path.name}":
+            raise ValueError("base snapshot identity no longer matches its load path")
+    else:
+        current_digest = adapter_fingerprinter(load_path)
+        if source_identity.immutable_id != f"sha256:{current_digest}":
+            raise ValueError("adapter checkpoint changed after identity resolution")
     if not torch_module.cuda.is_available():
         raise RuntimeError("CUDA is required for eight-rank validation synthesis")
     if context.local_rank >= torch_module.cuda.device_count():
@@ -198,9 +323,9 @@ def load_validation_tts(
         "device_map": f"cuda:{context.local_rank}",
         "dtype": torch_module.float16,
     }
-    if model_name is not None:
-        return model_class.from_pretrained(model_name, **loader_kwargs)
-    return model_class.from_lora_pretrained(checkpoint, **loader_kwargs)
+    if source_identity.kind == "base":
+        return model_class.from_pretrained(str(load_path), **loader_kwargs)
+    return model_class.from_lora_pretrained(load_path, **loader_kwargs)
 
 
 def initialize_distributed(
@@ -233,8 +358,7 @@ def synchronize_distributed(
     synchronized = False
     try:
         work = dist_module.barrier(async_op=True)
-        work.wait(timeout=timedelta(seconds=timeout_seconds))
-        synchronized = True
+        synchronized = work.wait(timeout=timedelta(seconds=timeout_seconds)) is True
     except (RuntimeError, TimeoutError):
         synchronized = False
     finally:
@@ -271,6 +395,18 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _assignment_provenance(row: ValidationAssignment) -> tuple[dict[str, Any], str]:
+    snapshot = asdict(row)
+    canonical = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return snapshot, hashlib.sha256(canonical).hexdigest()
+
+
 def _valid_wav(path: Path, expected_hash: object) -> bool:
     if not isinstance(expected_hash, str) or not _SHA256.fullmatch(expected_hash):
         return False
@@ -294,20 +430,28 @@ def _record_is_resumable(
     *,
     row: ValidationAssignment,
     rank: int,
-    checkpoint: str,
+    source_identity: ModelSourceIdentity,
     wav_path: Path,
 ) -> bool:
+    assignment, assignment_sha256 = _assignment_provenance(row)
     expected = {
+        "assignment": assignment,
+        "assignment_sha256": assignment_sha256,
+        "category": row.category,
+        "hard_number": row.hard_number,
         "id": row.id,
+        "normalized_gold": row.normalized_gold,
+        "text": row.text,
         "voice_id": row.voice_id,
         "rank": rank,
-        "checkpoint": checkpoint,
+        "checkpoint": source_identity.requested,
         "stressed": row.stressed,
         "reference_wav_sha256": row.reference_wav_sha256,
         "generation_config": asdict(row.generation_config),
         "wav": str(wav_path),
         "sample_rate": SAMPLE_RATE,
         "channels": 1,
+        "source_identity": asdict(source_identity),
     }
     if "error" in record or any(record.get(key) != value for key, value in expected.items()):
         return False
@@ -381,18 +525,31 @@ def _atomic_write_summary(path: Path, summary: SynthesisSummary) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def write_synthesis_summary(
+    output_dir: str | Path | ValidationPaths, summary: SynthesisSummary
+) -> Path:
+    """Atomically publish the durable summary for one synthesis rank."""
+    step_dir = _step_directory(output_dir)
+    path = step_dir / "rank-manifests" / f"rank-{summary.rank}.summary.json"
+    _atomic_write_summary(path, summary)
+    return path
+
+
 def _success_record(
     row: ValidationAssignment,
     *,
     rank: int,
-    checkpoint: str,
+    source_identity: ModelSourceIdentity,
     wav_path: Path,
     wav_hash: str,
 ) -> dict[str, Any]:
+    assignment, assignment_sha256 = _assignment_provenance(row)
     return {
+        "assignment": assignment,
+        "assignment_sha256": assignment_sha256,
         "category": row.category,
         "channels": 1,
-        "checkpoint": checkpoint,
+        "checkpoint": source_identity.requested,
         "generation_config": asdict(row.generation_config),
         "hard_number": row.hard_number,
         "id": row.id,
@@ -402,6 +559,7 @@ def _success_record(
         "reference_wav_sha256": row.reference_wav_sha256,
         "sample_rate": SAMPLE_RATE,
         "sha256": wav_hash,
+        "source_identity": asdict(source_identity),
         "stressed": row.stressed,
         "text": row.text,
         "voice_id": row.voice_id,
@@ -416,7 +574,7 @@ def synthesize_rank(
     output_dir: str | Path | ValidationPaths,
     rank: int,
     world_size: int,
-    checkpoint: str = "<injected-model>",
+    source_identity: ModelSourceIdentity,
     deadline_monotonic: float | None = None,
     stop_requested: Callable[[], bool] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
@@ -426,8 +584,8 @@ def synthesize_rank(
         raise ValueError("hard-number synthesis requires world_size=8")
     if not 0 <= rank < world_size:
         raise ValueError("rank must satisfy 0 <= rank < world_size")
-    if not isinstance(checkpoint, str) or not checkpoint.strip():
-        raise ValueError("checkpoint must be a non-blank string")
+    if not isinstance(source_identity, ModelSourceIdentity):
+        raise TypeError("source_identity must be a ModelSourceIdentity")
     if deadline_monotonic is not None and (
         isinstance(deadline_monotonic, bool)
         or not isinstance(deadline_monotonic, (int, float))
@@ -464,7 +622,7 @@ def synthesize_rank(
             records[row.id],
             row=row,
             rank=rank,
-            checkpoint=checkpoint,
+            source_identity=source_identity,
             wav_path=_wav_path(wav_dir, row.id),
         )
     }
@@ -507,7 +665,7 @@ def synthesize_rank(
                 _success_record(
                     row,
                     rank=rank,
-                    checkpoint=checkpoint,
+                    source_identity=source_identity,
                     wav_path=wav_path,
                     wav_hash=wav_hash,
                 )
@@ -516,10 +674,11 @@ def synthesize_rank(
         except Exception as error:  # noqa: BLE001 - durable per-row failure contract
             ledger.upsert(
                 {
-                    "checkpoint": checkpoint,
+                    "checkpoint": source_identity.requested,
                     "error": f"{type(error).__name__}: {error}",
                     "id": row.id,
                     "rank": rank,
+                    "source_identity": asdict(source_identity),
                     "voice_id": row.voice_id,
                 }
             )
@@ -531,7 +690,7 @@ def synthesize_rank(
             final_records[row.id],
             row=row,
             rank=rank,
-            checkpoint=checkpoint,
+            source_identity=source_identity,
             wav_path=_wav_path(wav_dir, row.id),
         )
         for row in local_rows
@@ -550,6 +709,7 @@ def synthesize_rank(
         failed=failed,
         complete=complete,
         stop_reason=stop_reason,
+        source_identity=source_identity,
     )
     _atomic_write_summary(summary_path, summary)
     return summary

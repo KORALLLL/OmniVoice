@@ -8,7 +8,7 @@ import math
 import signal
 import threading
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -20,8 +20,10 @@ from omnivoice.validation.synthesis import (
     load_validation_tts,
     release_validation_tts,
     resolve_distributed_context,
+    resolve_model_source,
     synchronize_distributed,
     synthesize_rank,
+    write_synthesis_summary,
 )
 
 INCOMPLETE_EXIT_CODE = 2
@@ -84,51 +86,98 @@ def _run_synth(
     *,
     assignment_loader: Callable[[Path], Any] = load_assignment_manifest,
     context_resolver: Callable[[], Any] = resolve_distributed_context,
+    source_resolver: Callable[..., Any] = resolve_model_source,
     distributed_initializer: Callable[[Any], None] = initialize_distributed,
     model_loader: Callable[..., Any] = load_validation_tts,
     synthesizer: Callable[..., Any] = synthesize_rank,
     synchronizer: Callable[[], bool] = synchronize_distributed,
     cuda_releaser: Callable[[], None] = release_validation_tts,
+    summary_writer: Callable[..., Path] = write_synthesis_summary,
 ) -> int:
     context = context_resolver()
     paths = ValidationPaths(args.output_root, args.run_id, args.step)
     model = None
     synchronized = False
     summary = None
-    try:
-        with _SigtermFlag() as stop_requested:
+    with _SigtermFlag() as stop_requested:
+        primary_error: BaseException | None = None
+        primary_traceback: TracebackType | None = None
+        cleanup_errors: list[BaseException] = []
+        try:
             assignments = assignment_loader(args.assignments)
-            model = model_loader(
+            source_identity = source_resolver(
                 model_name=args.model,
                 adapter_checkpoint=args.adapter_checkpoint,
+            )
+            model = model_loader(
+                source_identity=source_identity,
                 context=context,
             )
             distributed_initializer(context)
-            checkpoint = (
-                args.model if args.model is not None else str(args.adapter_checkpoint)
-            )
             summary = synthesizer(
                 assignments=assignments,
                 model=model,
                 output_dir=paths.step_dir,
                 rank=context.rank,
                 world_size=context.world_size,
-                checkpoint=checkpoint,
+                source_identity=source_identity,
                 deadline_monotonic=args.deadline_monotonic,
                 stop_requested=stop_requested,
             )
-    finally:
+        except BaseException as error:  # noqa: BLE001 - cleanup must still run
+            primary_error = error
+            primary_traceback = error.__traceback__
+
         try:
             synchronized = synchronizer()
-        finally:
+        except BaseException as error:  # noqa: BLE001 - preserve primary failure
+            cleanup_errors.append(error)
+        try:
             model = None
             cuda_releaser()
+        except BaseException as error:  # noqa: BLE001 - preserve primary failure
+            cleanup_errors.append(error)
 
-    payload = asdict(summary)
-    payload["synchronized"] = synchronized
-    payload["complete"] = bool(summary.complete and synchronized)
-    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    return 0 if payload["complete"] else INCOMPLETE_EXIT_CODE
+        if primary_error is not None:
+            for cleanup_error in cleanup_errors:
+                add_note = getattr(primary_error, "add_note", None)
+                if add_note is not None:
+                    add_note(
+                        "cleanup failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            raise primary_error.with_traceback(primary_traceback)
+        if cleanup_errors:
+            cleanup_error = cleanup_errors[0]
+            for secondary in cleanup_errors[1:]:
+                add_note = getattr(cleanup_error, "add_note", None)
+                if add_note is not None:
+                    add_note(
+                        "additional cleanup failure: "
+                        f"{type(secondary).__name__}: {secondary}"
+                    )
+            raise cleanup_error
+        if summary is None:
+            raise RuntimeError("synthesis returned no summary")
+
+        interrupted = stop_requested()
+        if interrupted or not synchronized:
+            summary = replace(
+                summary,
+                complete=False,
+                stop_reason=(
+                    "signal"
+                    if interrupted
+                    else summary.stop_reason or "synchronization"
+                ),
+            )
+            summary_writer(paths.step_dir, summary)
+
+        payload = asdict(summary)
+        payload["synchronized"] = synchronized
+        payload["complete"] = bool(summary.complete and synchronized)
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0 if payload["complete"] else INCOMPLETE_EXIT_CODE
 
 
 def main(argv: list[str] | None = None) -> int:
