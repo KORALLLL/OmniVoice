@@ -22,6 +22,7 @@ in ``omnivoice.cli.train``.
 """
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 
 from omnivoice.training.lora import DEFAULT_LORA_TARGET_MODULES
@@ -109,19 +110,41 @@ class TrainingConfig:
 
     def validate(self):
         """Validate bounded-training values before constructing the model."""
-        positive_values = (
+        integer_controls = (
             ("steps", self.steps),
             ("steps_per_epoch", self.steps_per_epoch),
             ("stop_after_step", self.stop_after_step),
-            ("max_wall_clock_seconds", self.max_wall_clock_seconds),
-            ("early_stop_eval_loss", self.early_stop_eval_loss),
             ("early_stop_patience", self.early_stop_patience),
         )
-        for name, value in positive_values:
-            if value is not None and value <= 0:
+        for name, value in integer_controls:
+            if value is None:
+                continue
+            if type(value) is not int:
+                raise ValueError(f"{name} must be an integer")
+            if value <= 0:
                 raise ValueError(f"{name} must be positive")
+
+        finite_controls = (
+            ("max_wall_clock_seconds", self.max_wall_clock_seconds),
+            ("early_stop_eval_loss", self.early_stop_eval_loss),
+        )
+        for name, value in finite_controls:
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{name} must be a finite number")
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+
         if self.stop_after_step is not None and self.stop_after_step > self.steps:
             raise ValueError("stop_after_step cannot exceed steps")
+        if self.eval_history_path is not None and (
+            not isinstance(self.eval_history_path, str)
+            or not self.eval_history_path.strip()
+        ):
+            raise ValueError("eval_history_path must be a non-empty string")
         return self
 
     @classmethod

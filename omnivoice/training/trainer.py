@@ -24,17 +24,20 @@ Launched via ``omnivoice.cli.train``.
 import logging
 import math
 import os
+import random
 import sys
 import time
 from datetime import timedelta
 from typing import Any
 
+import numpy as np
 import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import (
     DeepSpeedPlugin,
     InitProcessGroupKwargs,
     broadcast_object_list,
+    gather_object,
     set_seed,
 )
 from torch.utils.data import DataLoader
@@ -62,6 +65,34 @@ def _to_device(batch, device):
         k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
         for k, v in batch.items()
     }
+
+
+def _raise_if_rank_failed(accelerator, stage, local_error):
+    """Raise the same rank-local stage error on every distributed process."""
+    errors = [local_error]
+    if accelerator.num_processes > 1:
+        errors = gather_object(errors)
+    first_error = next((error for error in errors if error is not None), None)
+    if first_error is not None:
+        raise RuntimeError(f"{stage} failed: {first_error}")
+
+
+def _capture_host_rng_state():
+    """Capture host RNG state while reconstructing a resumed data cursor."""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_host_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 class OmniTrainer:
@@ -230,38 +261,71 @@ class OmniTrainer:
         if self.eval_dataloader is None:
             return {}
 
-        self.model.eval()
         logger.info(f"Running evaluation at step {self.global_step}...")
-
         local_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
         eval_count = 0
+        try:
+            local_error = None
+            try:
+                self.model.eval()
+                with torch.no_grad():
+                    for eval_batch in self.eval_dataloader:
+                        eval_batch = _to_device(eval_batch, self.accelerator.device)
+                        outputs = self.model(**eval_batch)
+                        local_loss_sum += outputs.loss.detach()
+                        eval_count += 1
+            except BaseException as exc:  # noqa: BLE001
+                process_index = getattr(self.accelerator, "process_index", 0)
+                local_error = (
+                    f"process {process_index} {type(exc).__name__}: {exc}"
+                )
+            _raise_if_rank_failed(
+                self.accelerator, "Evaluation forward pass", local_error
+            )
 
-        with torch.no_grad():
-            for eval_batch in self.eval_dataloader:
-                eval_batch = _to_device(eval_batch, self.accelerator.device)
-                outputs = self.model(**eval_batch)
-                local_loss_sum += outputs.loss.detach()
-                eval_count += 1
+            local_stats = torch.stack(
+                (local_loss_sum, local_loss_sum.new_tensor(eval_count))
+            )
+            all_stats = self.accelerator.gather(local_stats).reshape(-1, 2)
+            global_loss_sum = all_stats[:, 0].sum()
+            global_eval_count = all_stats[:, 1].sum()
+            if global_eval_count.item() == 0:
+                raise ValueError("Evaluation dataloader produced no batches")
+            final_eval_loss = (global_loss_sum / global_eval_count).item()
 
-        if eval_count > 0:
-            local_mean = local_loss_sum / eval_count
-        else:
-            local_mean = torch.tensor(0.0, device=self.accelerator.device)
-
-        all_means = self.accelerator.gather(local_mean)
-        final_eval_loss = all_means.mean().item()
-
-        eval_metrics = {"eval/loss": final_eval_loss}
-        self.accelerator.log(eval_metrics, step=self.global_step)
-        logger.info(f"Eval Loss: {final_eval_loss:.4f}")
-
-        self.accelerator.wait_for_everyone()
-        self.model.train()
-        return eval_metrics
+            eval_metrics = {"eval/loss": final_eval_loss}
+            local_error = None
+            try:
+                self.accelerator.log(eval_metrics, step=self.global_step)
+                logger.info(f"Eval Loss: {final_eval_loss:.4f}")
+            except BaseException as exc:  # noqa: BLE001
+                process_index = getattr(self.accelerator, "process_index", 0)
+                local_error = (
+                    f"process {process_index} {type(exc).__name__}: {exc}"
+                )
+            _raise_if_rank_failed(
+                self.accelerator, "Evaluation logging", local_error
+            )
+            self.accelerator.wait_for_everyone()
+            return eval_metrics
+        finally:
+            self.model.train()
 
     def train(self):
-        """Run one bounded training invocation against the total LR schedule."""
+        """Run one bounded training invocation and always tear down logging."""
         logger.info("Starting Training Loop...")
+        train_logger = TrainLogger(
+            self.accelerator, self.config.steps, self.config.logging_steps
+        )
+        try:
+            return self._train(train_logger)
+        finally:
+            try:
+                train_logger.close()
+            finally:
+                self.accelerator.end_training()
+
+    def _train(self, train_logger):
         invocation_start_time = time.monotonic()
         invocation_stop = self.config.stop_after_step or self.config.steps
         stop_policy = EvaluationStopPolicy(
@@ -288,14 +352,33 @@ class OmniTrainer:
         if hasattr(self.train_dataloader.dataset, "set_epoch"):
             self.train_dataloader.dataset.set_epoch(self.epoch)
 
-        # Logger
-        train_logger = TrainLogger(
-            self.accelerator, self.config.steps, self.config.logging_steps
-        )
         train_logger.start(self.global_step)
 
         self.model.train()
-        train_iterator = iter(self.train_dataloader)
+        optimizer_steps_into_epoch = (
+            self.global_step % self.config.steps_per_epoch
+            if self.config.resume_from_checkpoint
+            and self.config.steps_per_epoch is not None
+            else 0
+        )
+        batches_to_skip = (
+            optimizer_steps_into_epoch
+            * self.config.gradient_accumulation_steps
+        )
+        if batches_to_skip > 0:
+            restored_rng_state = _capture_host_rng_state()
+            try:
+                train_iterator = iter(self.train_dataloader)
+                for _ in range(batches_to_skip):
+                    next(train_iterator)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    "steps_per_epoch exceeds the available resumed epoch data"
+                ) from exc
+            finally:
+                _restore_host_rng_state(restored_rng_state)
+        else:
+            train_iterator = iter(self.train_dataloader)
 
         logging_start_time = time.time()
         logging_start_step = self.global_step
@@ -418,7 +501,8 @@ class OmniTrainer:
 
                     if self.global_step >= invocation_stop:
                         if (
-                            self.eval_dataloader is not None
+                            self.config.stop_after_step is not None
+                            and self.eval_dataloader is not None
                             and last_evaluated_step != self.global_step
                         ):
                             decision = evaluate_and_decide()
@@ -438,7 +522,8 @@ class OmniTrainer:
 
         if stop_reason is None:
             if (
-                self.eval_dataloader is not None
+                self.config.stop_after_step is not None
+                and self.eval_dataloader is not None
                 and last_evaluated_step != self.global_step
             ):
                 decision = evaluate_and_decide()
@@ -453,8 +538,6 @@ class OmniTrainer:
 
         # Final Save
         self.save_checkpoint(self.global_step)
-        train_logger.close()
-        self.accelerator.end_training()
         return TrainingOutcome(
             step=self.global_step,
             stop_reason=stop_reason,
