@@ -401,6 +401,27 @@ def test_writer_rejects_altered_generation_config(tmp_path: Path) -> None:
         write_assignment_manifest(assignments, tmp_path / "assignments.jsonl")
 
 
+@pytest.mark.parametrize(
+    ("assignment_index", "mutated_id", "message"),
+    [
+        (1, " prompt-0001", "dataset ID must be a canonical normalized string"),
+        (1, "prompt-0001 ", "dataset ID must be a canonical normalized string"),
+        (1, "prompt-0000 ", "duplicate normalized hard-number IDs"),
+        (1, 1, "dataset ID must be a canonical normalized string"),
+    ],
+)
+def test_writer_rejects_noncanonical_or_normalized_collision_ids(
+    tmp_path: Path, assignment_index: int, mutated_id: object, message: str
+) -> None:
+    assignments, _ = _assignments(tmp_path)
+    assignments[assignment_index] = replace(
+        assignments[assignment_index], id=mutated_id
+    )
+
+    with pytest.raises(ValueError, match=message):
+        write_assignment_manifest(assignments, tmp_path / "assignments.jsonl")
+
+
 @pytest.mark.parametrize("distribution", ["one_voice", "imbalanced"])
 def test_writer_rejects_non_balanced_voice_distribution(
     tmp_path: Path, distribution: str

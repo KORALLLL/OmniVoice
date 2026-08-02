@@ -125,6 +125,17 @@ def download_hard_number_jsonl() -> Path:
     )
 
 
+def _normalize_hard_number_id(value: object, context: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(  # noqa: TRY004 - malformed dataset value
+            f"{context} must be a non-blank string or integer"
+        )
+    normalized = str(value).strip()
+    if not normalized:
+        raise ValueError(f"{context} must be a non-blank string or integer")
+    return normalized
+
+
 def load_hard_number_rows(
     path: str | Path,
     *,
@@ -152,16 +163,9 @@ def load_hard_number_rows(
             if not isinstance(raw, dict):
                 raise TypeError(f"line {line_number} must contain a JSON object")
 
-            raw_id = raw.get("id")
-            if isinstance(raw_id, bool) or not isinstance(raw_id, (int, str)):
-                raise ValueError(  # noqa: TRY004 - malformed dataset value
-                    f"line {line_number} field 'id' must be a non-blank string or integer"
-                )
-            normalized_id = str(raw_id).strip()
-            if not normalized_id:
-                raise ValueError(
-                    f"line {line_number} field 'id' must be a non-blank string or integer"
-                )
+            normalized_id = _normalize_hard_number_id(
+                raw.get("id"), f"line {line_number} field 'id'"
+            )
 
             values: dict[str, str] = {"id": normalized_id}
             for field in REQUIRED_FIELDS[1:]:
@@ -435,9 +439,16 @@ def _validate_assignment_manifest_contract(
             f"assignment manifest must contain exactly {HARD_NUMBER_COUNT} rows; "
             f"found {len(assignments)}"
         )
+    normalized_ids = [
+        _normalize_hard_number_id(assignment.id, "assignment dataset ID")
+        for assignment in assignments
+    ]
+    if len(set(normalized_ids)) != len(normalized_ids):
+        raise ValueError("assignment manifest contains duplicate normalized hard-number IDs")
+    for assignment, normalized_id in zip(assignments, normalized_ids, strict=True):
+        if not isinstance(assignment.id, str) or assignment.id != normalized_id:
+            raise ValueError("assignment dataset ID must be a canonical normalized string")
     ordered = sorted(assignments, key=lambda item: item.id)
-    if len({assignment.id for assignment in ordered}) != len(ordered):
-        raise ValueError("assignment manifest contains duplicate hard-number IDs")
 
     expected_provenance = (
         HARD_NUMBER_REPO,
