@@ -32,6 +32,7 @@ from omnivoice.validation.synthesis import (
     load_validation_tts,
     resolve_distributed_context,
     resolve_model_source,
+    run_bounded,
     synchronize_distributed,
     synthesize_rank,
 )
@@ -869,7 +870,7 @@ def test_synchronization_requires_work_wait_to_return_exactly_true() -> None:
     assert dist.destroyed is True
 
 
-def test_destroy_process_group_timeout_is_bounded() -> None:
+def test_outer_lifecycle_deadline_owns_blocking_process_group_destroy() -> None:
     release = threading.Event()
     timer = threading.Timer(0.5, release.set)
 
@@ -900,14 +901,14 @@ def test_destroy_process_group_timeout_is_bounded() -> None:
     timer.start()
     started = time.monotonic()
     try:
-        assert (
-            synchronize_distributed(
-                dist_module=Dist(),
-                timeout_seconds=0.01,
-                destroy_timeout_seconds=0.02,
+        with pytest.raises(TimeoutError, match="synchronization"):
+            run_bounded(
+                lambda: synchronize_distributed(
+                    dist_module=Dist(), timeout_seconds=0.01
+                ),
+                deadline_monotonic=time.monotonic() + 0.02,
+                description="synchronization",
             )
-            is False
-        )
         assert time.monotonic() - started < 0.2
     finally:
         release.set()

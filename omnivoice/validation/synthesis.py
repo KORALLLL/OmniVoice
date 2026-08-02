@@ -137,17 +137,20 @@ class SynthesisSummary:
 def run_bounded(
     function: Callable[[], Any],
     *,
-    timeout_seconds: float,
+    deadline_monotonic: float,
     description: str,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> Any:
     """Run lifecycle work in a daemon thread so a hung call cannot hold exit."""
     if (
-        isinstance(timeout_seconds, bool)
-        or not isinstance(timeout_seconds, (int, float))
-        or not math.isfinite(timeout_seconds)
-        or timeout_seconds <= 0
+        isinstance(deadline_monotonic, bool)
+        or not isinstance(deadline_monotonic, (int, float))
+        or not math.isfinite(deadline_monotonic)
     ):
-        raise ValueError("timeout_seconds must be finite and positive")
+        raise ValueError("deadline_monotonic must be finite")
+    remaining = deadline_monotonic - monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"{description} exceeded the cleanup deadline")
     done = threading.Event()
     outcome: list[tuple[bool, Any]] = []
 
@@ -165,8 +168,8 @@ def run_bounded(
         daemon=True,
     )
     worker.start()
-    if not done.wait(timeout_seconds):
-        raise TimeoutError(f"{description} exceeded {timeout_seconds:g} seconds")
+    if not done.wait(remaining):
+        raise TimeoutError(f"{description} exceeded the cleanup deadline")
     succeeded, value = outcome[0]
     if not succeeded:
         raise value
@@ -467,9 +470,8 @@ def synchronize_distributed(
     *,
     dist_module: Any = torch.distributed,
     timeout_seconds: float = 30.0,
-    destroy_timeout_seconds: float = 30.0,
 ) -> bool:
-    """Attempt a bounded barrier and always tear down the process group."""
+    """Attempt a barrier and tear down under the caller's process deadline."""
     if not dist_module.is_available() or not dist_module.is_initialized():
         return True
     synchronized = False
@@ -480,12 +482,8 @@ def synchronize_distributed(
         synchronized = False
     finally:
         try:
-            run_bounded(
-                dist_module.destroy_process_group,
-                timeout_seconds=destroy_timeout_seconds,
-                description="distributed process-group cleanup",
-            )
-        except (RuntimeError, TimeoutError):
+            dist_module.destroy_process_group()
+        except RuntimeError:
             synchronized = False
     return synchronized
 

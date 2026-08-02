@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import signal
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -30,6 +32,10 @@ from omnivoice.validation.synthesis import (
 )
 
 INCOMPLETE_EXIT_CODE = 2
+
+
+def _output_json(payload: str) -> None:
+    print(payload, flush=True)
 
 
 def _finite_float(value: str) -> float:
@@ -84,6 +90,27 @@ class _SigtermFlag:
             signal.signal(signal.SIGTERM, self.previous)
 
 
+class _FinalSigtermBoundary:
+    """Defer SIGTERM while one authoritative result is committed."""
+
+    def __init__(self) -> None:
+        self.previous_mask: set[signal.Signals] | None = None
+
+    def __enter__(self) -> Callable[[], bool]:
+        self.previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        return lambda: signal.SIGTERM in signal.sigpending()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+        if self.previous_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, self.previous_mask)
+
+
 def _run_synth(
     args: argparse.Namespace,
     *,
@@ -98,12 +125,14 @@ def _run_synth(
     summary_writer: Callable[..., Path] = write_synthesis_summary,
     summary_reader: Callable[..., Any] = read_synthesis_summary,
     serializer: Callable[..., str] = json.dumps,
-    output: Callable[[str], None] = print,
+    output: Callable[[str], None] = _output_json,
     cleanup_timeout_seconds: float = 30.0,
+    monotonic: Callable[[], float] = time.monotonic,
+    hard_exit: Callable[[int], Any] = os._exit,
 ) -> int:
     context = context_resolver()
     paths = ValidationPaths(args.output_root, args.run_id, args.step)
-    model = None
+    model_holder: list[Any] = [None]
     synchronized = False
     summary = None
     with _SigtermFlag() as stop_requested:
@@ -116,14 +145,14 @@ def _run_synth(
                 model_name=args.model,
                 adapter_checkpoint=args.adapter_checkpoint,
             )
-            model = model_loader(
+            model_holder[0] = model_loader(
                 source_identity=source_identity,
                 context=context,
             )
             distributed_initializer(context)
             summary = synthesizer(
                 assignments=assignments,
-                model=model,
+                model=model_holder[0],
                 output_dir=paths.step_dir,
                 rank=context.rank,
                 world_size=context.world_size,
@@ -135,27 +164,73 @@ def _run_synth(
             primary_error = error
             primary_traceback = error.__traceback__
 
+        cleanup_deadline = monotonic() + cleanup_timeout_seconds
+
+        def read_existing_summary() -> None:
+            nonlocal summary
+            if summary is None:
+                summary = summary_reader(paths.step_dir, context.rank)
+
+        def correct_summary(stage: str, lifecycle_error: BaseException) -> None:
+            nonlocal summary
+            read_existing_summary()
+            if summary is None:
+                return
+            summary = replace(
+                summary,
+                complete=False,
+                stop_reason=stage,
+                error=LifecycleError(
+                    stage=stage,
+                    type=type(lifecycle_error).__name__,
+                    message=str(lifecycle_error),
+                ),
+            )
+            summary_writer(paths.step_dir, summary)
+
+        def terminate_abandoned_worker(stage: str, error: TimeoutError) -> None:
+            try:
+                correct_summary(stage, error)
+                if summary is not None:
+                    payload = asdict(summary)
+                    payload["synchronized"] = synchronized
+                    payload["complete"] = False
+                    output(serializer(payload, ensure_ascii=False, sort_keys=True))
+            finally:
+                hard_exit(INCOMPLETE_EXIT_CODE)
+            raise AssertionError("hard_exit returned unexpectedly")
+
         try:
             synchronized = run_bounded(
                 synchronizer,
-                timeout_seconds=cleanup_timeout_seconds,
+                deadline_monotonic=cleanup_deadline,
                 description="synchronization",
+                monotonic=monotonic,
             )
+        except TimeoutError as error:
+            terminate_abandoned_worker("synchronization", error)
         except BaseException as error:  # noqa: BLE001 - preserve primary failure
             cleanup_errors.append(("synchronization", error))
+
+        def release_owned_model() -> None:
+            model_holder.clear()
+            cuda_releaser()
+
         try:
-            model = None
             run_bounded(
-                cuda_releaser,
-                timeout_seconds=cleanup_timeout_seconds,
+                release_owned_model,
+                deadline_monotonic=cleanup_deadline,
                 description="cleanup",
+                monotonic=monotonic,
             )
+        except TimeoutError as error:
+            terminate_abandoned_worker("cleanup", error)
         except BaseException as error:  # noqa: BLE001 - preserve primary failure
             cleanup_errors.append(("cleanup", error))
 
         if summary is None and (primary_error is not None or cleanup_errors):
             try:
-                summary = summary_reader(paths.step_dir, context.rank)
+                read_existing_summary()
             except BaseException as error:  # noqa: BLE001 - preserve primary failure
                 cleanup_errors.append(("summary", error))
 
@@ -203,46 +278,27 @@ def _run_synth(
         if summary is None:
             raise RuntimeError("synthesis returned no summary")
 
-        interrupted = stop_requested()
-        if interrupted or not synchronized:
-            summary = replace(
-                summary,
-                complete=False,
-                stop_reason=(
-                    "signal"
-                    if interrupted
-                    else summary.stop_reason or "synchronization"
-                ),
-            )
-            summary_writer(paths.step_dir, summary)
-
-        def incomplete_after_signal() -> None:
-            nonlocal summary
-            if stop_requested() and summary.complete:
-                summary = replace(summary, complete=False, stop_reason="signal")
+        with _FinalSigtermBoundary() as pending_sigterm:
+            interrupted = stop_requested() or pending_sigterm()
+            if interrupted or not synchronized:
+                summary = replace(
+                    summary,
+                    complete=False,
+                    stop_reason=(
+                        "signal"
+                        if interrupted
+                        else summary.stop_reason or "synchronization"
+                    ),
+                )
                 summary_writer(paths.step_dir, summary)
 
-        def payload_text() -> tuple[dict[str, Any], str]:
             payload = asdict(summary)
             payload["synchronized"] = synchronized
             payload["complete"] = bool(summary.complete and synchronized)
-            return payload, serializer(payload, ensure_ascii=False, sort_keys=True)
-
-        incomplete_after_signal()
-        payload, serialized = payload_text()
-        incomplete_after_signal()
-        if payload["complete"] != bool(summary.complete and synchronized):
-            payload, serialized = payload_text()
-        output(serialized)
-        incomplete_after_signal()
-        if payload["complete"] != bool(summary.complete and synchronized):
-            payload, serialized = payload_text()
+            serialized = serializer(payload, ensure_ascii=False, sort_keys=True)
             output(serialized)
-        incomplete_after_signal()
-        if payload["complete"] != bool(summary.complete and synchronized):
-            payload, serialized = payload_text()
-            output(serialized)
-        return 0 if payload["complete"] else INCOMPLETE_EXIT_CODE
+            code = 0 if payload["complete"] else INCOMPLETE_EXIT_CODE
+        return code
 
 
 def main(argv: list[str] | None = None) -> int:

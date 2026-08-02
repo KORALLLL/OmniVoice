@@ -379,10 +379,18 @@ for phase in ("load", "generation", "sync", "release"):
         assert json.loads(durable.read_text(encoding="utf-8"))["complete"] is False
 
 
-@pytest.mark.parametrize("signal_phase", ["serialize", "output"])
-def test_sigterm_during_final_payload_cannot_leave_success_authoritative(
+@pytest.mark.parametrize(
+    ("signal_phase", "expected_complete", "expected_code"),
+    [
+        ("before_serialization", False, INCOMPLETE_EXIT_CODE),
+        ("output", True, 0),
+    ],
+)
+def test_final_payload_is_one_atomic_sigterm_boundary(
     tmp_path: Path,
     signal_phase: str,
+    expected_complete: bool,
+    expected_code: int,
 ) -> None:
     args = SimpleNamespace(
         assignments=tmp_path / "assignments.jsonl",
@@ -407,12 +415,12 @@ def test_sigterm_during_final_payload_cannot_leave_success_authoritative(
     )
     emitted: list[str] = []
     serialized = 0
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
 
     def serializer(payload, **kwargs):
         nonlocal serialized
         serialized += 1
-        if signal_phase == "serialize" and serialized == 1:
-            os.kill(os.getpid(), signal.SIGTERM)
         return json.dumps(payload, **kwargs)
 
     def output(payload: str) -> None:
@@ -428,17 +436,26 @@ def test_sigterm_during_final_payload_cannot_leave_success_authoritative(
         distributed_initializer=lambda context: None,
         model_loader=lambda **kwargs: object(),
         synthesizer=lambda **kwargs: summary,
-        synchronizer=lambda: True,
+        synchronizer=lambda: (
+            os.kill(os.getpid(), signal.SIGTERM) or True
+            if signal_phase == "before_serialization"
+            else True
+        ),
         cuda_releaser=lambda: None,
         serializer=serializer,
         output=output,
     )
 
-    assert code == INCOMPLETE_EXIT_CODE
-    assert json.loads(emitted[-1])["complete"] is False
-    assert json.loads(emitted[-1])["stop_reason"] == "signal"
-    durable = tmp_path / "run" / "step-0" / "rank-manifests" / "rank-0.summary.json"
-    assert json.loads(durable.read_text(encoding="utf-8"))["complete"] is False
+    assert code == expected_code
+    assert serialized == 1
+    assert len(emitted) == 1
+    assert json.loads(emitted[0])["complete"] is expected_complete
+    assert signal.getsignal(signal.SIGTERM) is previous_handler
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == previous_mask
+    if signal_phase == "before_serialization":
+        assert json.loads(emitted[0])["stop_reason"] == "signal"
+        durable = tmp_path / "run" / "step-0" / "rank-manifests" / "rank-0.summary.json"
+        assert json.loads(durable.read_text(encoding="utf-8"))["complete"] is False
 
 
 def test_unresolved_source_fails_before_model_loader_or_distributed_gpu_work(
@@ -475,10 +492,17 @@ def test_unresolved_source_fails_before_model_loader_or_distributed_gpu_work(
 
 @pytest.mark.parametrize(
     ("stage", "expected_reason"),
-    [("synchronization", "synchronization"), ("cleanup", "cleanup")],
+    [
+        ("synchronization", "synchronization"),
+        ("destructor", "cleanup"),
+        ("cleanup", "cleanup"),
+    ],
 )
 def test_blocking_lifecycle_cleanup_is_bounded_and_corrects_summary(
-    tmp_path: Path, stage: str, expected_reason: str
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    stage: str,
+    expected_reason: str,
 ) -> None:
     args = SimpleNamespace(
         assignments=tmp_path / "assignments.jsonl",
@@ -504,27 +528,50 @@ def test_blocking_lifecycle_cleanup_is_bounded_and_corrects_summary(
     release = threading.Event()
     timer = threading.Timer(0.5, release.set)
 
+    marker: list[str] = []
+
     def block() -> bool:
         release.wait()
+        marker.append("abandoned-worker-continued")
         return True
+
+    class BlockingDestructor:
+        def __del__(self):
+            block()
+
+    class HardExit(BaseException):
+        def __init__(self, code: int) -> None:
+            self.code = code
+
+    def hard_exit(code: int) -> None:
+        raise HardExit(code)
 
     timer.start()
     started = time.monotonic()
     try:
-        with pytest.raises(TimeoutError, match=expected_reason):
+        with pytest.raises(HardExit) as exc_info:
             _run_synth(
                 args,
                 assignment_loader=lambda path: [],
                 context_resolver=lambda: DistributedContext(0, 0, 8),
                 source_resolver=lambda **kwargs: source_identity,
                 distributed_initializer=lambda context: None,
-                model_loader=lambda **kwargs: object(),
+                model_loader=lambda **kwargs: (
+                    BlockingDestructor() if stage == "destructor" else object()
+                ),
                 synthesizer=lambda **kwargs: summary,
                 synchronizer=block if stage == "synchronization" else lambda: True,
-                cuda_releaser=block if stage == "cleanup" else lambda: None,
+                cuda_releaser=(
+                    block
+                    if stage == "cleanup"
+                    else lambda: marker.append("release-called")
+                ),
                 cleanup_timeout_seconds=0.02,
+                hard_exit=hard_exit,
             )
+        assert exc_info.value.code == INCOMPLETE_EXIT_CODE
         assert time.monotonic() - started < 0.2
+        assert marker == []
     finally:
         release.set()
         timer.cancel()
@@ -538,6 +585,133 @@ def test_blocking_lifecycle_cleanup_is_bounded_and_corrects_summary(
     assert durable["stop_reason"] == expected_reason
     assert durable["error"]["stage"] == expected_reason
     assert durable["error"]["type"] == "TimeoutError"
+    payloads = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{")
+    ]
+    assert len(payloads) == 1
+    assert payloads[0]["complete"] is False
+
+
+@pytest.mark.parametrize("stage", ["synchronization", "destructor", "cleanup"])
+def test_real_rank_process_hard_exits_with_no_abandoned_worker_progress(
+    tmp_path: Path, stage: str
+) -> None:
+    child = r"""
+import json
+import os
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+from omnivoice.cli.validate_hard_numbers import _run_synth
+from omnivoice.validation.synthesis import (
+    DistributedContext,
+    ModelSourceIdentity,
+    SynthesisSummary,
+)
+
+root = Path(os.environ["SYNTH_HARD_EXIT_ROOT"])
+stage = os.environ["SYNTH_HARD_EXIT_STAGE"]
+source_path = root / "immutable-source"
+source_path.mkdir(parents=True, exist_ok=True)
+source_identity = ModelSourceIdentity(
+    kind="base",
+    requested="base",
+    load_path=str(source_path.resolve()),
+    immutable_id="hf:" + "a" * 40,
+)
+summary = SynthesisSummary(
+    rank=0,
+    expected=250,
+    completed=250,
+    generated=250,
+    skipped=0,
+    failed=0,
+    complete=True,
+    stop_reason=None,
+    source_identity=source_identity,
+)
+
+def block():
+    time.sleep(0.5)
+    (root / "abandoned-worker-marker").write_text(stage, encoding="utf-8")
+    return True
+
+class BlockingDestructor:
+    def __del__(self):
+        block()
+
+args = SimpleNamespace(
+    assignments=root / "assignments.jsonl",
+    output_root=root,
+    run_id="run",
+    step=0,
+    model="base",
+    adapter_checkpoint=None,
+    deadline_monotonic=None,
+)
+(root / "ready").write_text("yes", encoding="utf-8")
+_run_synth(
+    args,
+    assignment_loader=lambda path: [],
+    context_resolver=lambda: DistributedContext(0, 0, 8),
+    source_resolver=lambda **kwargs: source_identity,
+    distributed_initializer=lambda context: None,
+    model_loader=lambda **kwargs: (
+        BlockingDestructor() if stage == "destructor" else object()
+    ),
+    synthesizer=lambda **kwargs: summary,
+    synchronizer=block if stage == "synchronization" else lambda: True,
+    cuda_releaser=block if stage == "cleanup" else lambda: None,
+    cleanup_timeout_seconds=0.05,
+)
+(root / "after-hard-exit").write_text("unsafe", encoding="utf-8")
+"""
+    environment = {
+        **os.environ,
+        "SYNTH_HARD_EXIT_ROOT": str(tmp_path),
+        "SYNTH_HARD_EXIT_STAGE": stage,
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-c", child],
+        cwd=Path.cwd(),
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    ready_deadline = time.monotonic() + 120.0
+    while (
+        not (tmp_path / "ready").exists()
+        and process.poll() is None
+        and time.monotonic() < ready_deadline
+    ):
+        time.sleep(0.01)
+    assert (tmp_path / "ready").is_file()
+
+    started = time.monotonic()
+    stdout, stderr = process.communicate(timeout=2.0)
+    assert time.monotonic() - started < 0.5
+    assert process.returncode == INCOMPLETE_EXIT_CODE, stderr
+    payloads = [
+        json.loads(line) for line in stdout.splitlines() if line.startswith("{")
+    ]
+    assert len(payloads) == 1
+    assert payloads[0]["complete"] is False
+    assert payloads[0]["stop_reason"] == (
+        "synchronization" if stage == "synchronization" else "cleanup"
+    )
+    durable = json.loads(
+        (
+            tmp_path / "run" / "step-0" / "rank-manifests" / "rank-0.summary.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert durable["complete"] is False
+    time.sleep(0.55)
+    assert not (tmp_path / "abandoned-worker-marker").exists()
+    assert not (tmp_path / "after-hard-exit").exists()
 
 
 @pytest.mark.parametrize(
