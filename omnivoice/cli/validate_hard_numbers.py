@@ -15,12 +15,15 @@ from typing import Any
 
 from omnivoice.validation.artifacts import ValidationPaths
 from omnivoice.validation.synthesis import (
+    LifecycleError,
     initialize_distributed,
     load_assignment_manifest,
     load_validation_tts,
+    read_synthesis_summary,
     release_validation_tts,
     resolve_distributed_context,
     resolve_model_source,
+    run_bounded,
     synchronize_distributed,
     synthesize_rank,
     write_synthesis_summary,
@@ -93,6 +96,10 @@ def _run_synth(
     synchronizer: Callable[[], bool] = synchronize_distributed,
     cuda_releaser: Callable[[], None] = release_validation_tts,
     summary_writer: Callable[..., Path] = write_synthesis_summary,
+    summary_reader: Callable[..., Any] = read_synthesis_summary,
+    serializer: Callable[..., str] = json.dumps,
+    output: Callable[[str], None] = print,
+    cleanup_timeout_seconds: float = 30.0,
 ) -> int:
     context = context_resolver()
     paths = ValidationPaths(args.output_root, args.run_id, args.step)
@@ -102,7 +109,7 @@ def _run_synth(
     with _SigtermFlag() as stop_requested:
         primary_error: BaseException | None = None
         primary_traceback: TracebackType | None = None
-        cleanup_errors: list[BaseException] = []
+        cleanup_errors: list[tuple[str, BaseException]] = []
         try:
             assignments = assignment_loader(args.assignments)
             source_identity = source_resolver(
@@ -129,31 +136,67 @@ def _run_synth(
             primary_traceback = error.__traceback__
 
         try:
-            synchronized = synchronizer()
+            synchronized = run_bounded(
+                synchronizer,
+                timeout_seconds=cleanup_timeout_seconds,
+                description="synchronization",
+            )
         except BaseException as error:  # noqa: BLE001 - preserve primary failure
-            cleanup_errors.append(error)
+            cleanup_errors.append(("synchronization", error))
         try:
             model = None
-            cuda_releaser()
+            run_bounded(
+                cuda_releaser,
+                timeout_seconds=cleanup_timeout_seconds,
+                description="cleanup",
+            )
         except BaseException as error:  # noqa: BLE001 - preserve primary failure
-            cleanup_errors.append(error)
+            cleanup_errors.append(("cleanup", error))
+
+        if summary is None and (primary_error is not None or cleanup_errors):
+            try:
+                summary = summary_reader(paths.step_dir, context.rank)
+            except BaseException as error:  # noqa: BLE001 - preserve primary failure
+                cleanup_errors.append(("summary", error))
+
+        lifecycle_failure = (
+            cleanup_errors[0]
+            if cleanup_errors
+            else (("synthesis", primary_error) if primary_error is not None else None)
+        )
+        if summary is not None and lifecycle_failure is not None:
+            stage, lifecycle_error = lifecycle_failure
+            summary = replace(
+                summary,
+                complete=False,
+                stop_reason=stage,
+                error=LifecycleError(
+                    stage=stage,
+                    type=type(lifecycle_error).__name__,
+                    message=str(lifecycle_error),
+                ),
+            )
+            try:
+                summary_writer(paths.step_dir, summary)
+            except BaseException as error:  # noqa: BLE001 - preserve primary failure
+                cleanup_errors.append(("summary", error))
 
         if primary_error is not None:
-            for cleanup_error in cleanup_errors:
+            for stage, cleanup_error in cleanup_errors:
                 add_note = getattr(primary_error, "add_note", None)
                 if add_note is not None:
                     add_note(
-                        "cleanup failure: "
+                        f"{stage} failure: "
                         f"{type(cleanup_error).__name__}: {cleanup_error}"
                     )
             raise primary_error.with_traceback(primary_traceback)
         if cleanup_errors:
-            cleanup_error = cleanup_errors[0]
-            for secondary in cleanup_errors[1:]:
+            _, cleanup_error = cleanup_errors[0]
+            for stage, secondary in cleanup_errors[1:]:
                 add_note = getattr(cleanup_error, "add_note", None)
                 if add_note is not None:
                     add_note(
-                        "additional cleanup failure: "
+                        f"additional {stage} failure: "
                         f"{type(secondary).__name__}: {secondary}"
                     )
             raise cleanup_error
@@ -173,10 +216,32 @@ def _run_synth(
             )
             summary_writer(paths.step_dir, summary)
 
-        payload = asdict(summary)
-        payload["synchronized"] = synchronized
-        payload["complete"] = bool(summary.complete and synchronized)
-        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        def incomplete_after_signal() -> None:
+            nonlocal summary
+            if stop_requested() and summary.complete:
+                summary = replace(summary, complete=False, stop_reason="signal")
+                summary_writer(paths.step_dir, summary)
+
+        def payload_text() -> tuple[dict[str, Any], str]:
+            payload = asdict(summary)
+            payload["synchronized"] = synchronized
+            payload["complete"] = bool(summary.complete and synchronized)
+            return payload, serializer(payload, ensure_ascii=False, sort_keys=True)
+
+        incomplete_after_signal()
+        payload, serialized = payload_text()
+        incomplete_after_signal()
+        if payload["complete"] != bool(summary.complete and synchronized):
+            payload, serialized = payload_text()
+        output(serialized)
+        incomplete_after_signal()
+        if payload["complete"] != bool(summary.complete and synchronized):
+            payload, serialized = payload_text()
+            output(serialized)
+        incomplete_after_signal()
+        if payload["complete"] != bool(summary.complete and synchronized):
+            payload, serialized = payload_text()
+            output(serialized)
         return 0 if payload["complete"] else INCOMPLETE_EXIT_CODE
 
 

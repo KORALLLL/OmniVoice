@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
@@ -48,6 +49,17 @@ GENERATION_CONFIG = OmniVoiceGenerationConfig(
 )
 
 
+def _adapter_composite_sha256(content_sha256: str, base_source: Any) -> str:
+    canonical = json.dumps(
+        {"adapter_sha256": content_sha256, "base_source": asdict(base_source)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 @dataclass(frozen=True)
 class DistributedContext:
     rank: int
@@ -63,6 +75,8 @@ class ModelSourceIdentity:
     requested: str
     load_path: str
     immutable_id: str
+    content_sha256: str | None = None
+    base_source: ModelSourceIdentity | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"base", "adapter"}:
@@ -79,6 +93,31 @@ class ModelSourceIdentity:
             digest
         ):
             raise ValueError("model source immutable_id is malformed")
+        if self.kind == "base":
+            if self.content_sha256 is not None or self.base_source is not None:
+                raise ValueError("base source may not contain adapter identity fields")
+        elif (
+            not isinstance(self.content_sha256, str)
+            or not _SHA256.fullmatch(self.content_sha256)
+            or not isinstance(self.base_source, ModelSourceIdentity)
+            or self.base_source.kind != "base"
+        ):
+            raise ValueError(
+                "adapter source requires a content SHA-256 and immutable base source"
+            )
+        elif self.immutable_id != (
+            "sha256:" + _adapter_composite_sha256(self.content_sha256, self.base_source)
+        ):
+            raise ValueError("adapter composite identity does not match its sources")
+
+
+@dataclass(frozen=True)
+class LifecycleError:
+    """Structured reason a rank summary was corrected after synthesis."""
+
+    stage: str
+    type: str
+    message: str
 
 
 @dataclass(frozen=True)
@@ -92,6 +131,46 @@ class SynthesisSummary:
     complete: bool
     stop_reason: str | None
     source_identity: ModelSourceIdentity
+    error: LifecycleError | None = None
+
+
+def run_bounded(
+    function: Callable[[], Any],
+    *,
+    timeout_seconds: float,
+    description: str,
+) -> Any:
+    """Run lifecycle work in a daemon thread so a hung call cannot hold exit."""
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("timeout_seconds must be finite and positive")
+    done = threading.Event()
+    outcome: list[tuple[bool, Any]] = []
+
+    def invoke() -> None:
+        try:
+            outcome.append((True, function()))
+        except BaseException as error:  # noqa: BLE001 - propagate caller failure
+            outcome.append((False, error))
+        finally:
+            done.set()
+
+    worker = threading.Thread(
+        target=invoke,
+        name=f"omnivoice-{description.replace(' ', '-')}",
+        daemon=True,
+    )
+    worker.start()
+    if not done.wait(timeout_seconds):
+        raise TimeoutError(f"{description} exceeded {timeout_seconds:g} seconds")
+    succeeded, value = outcome[0]
+    if not succeeded:
+        raise value
+    return value
 
 
 def _adapter_checkpoint_root(checkpoint_path: str | Path) -> Path:
@@ -177,14 +256,42 @@ def resolve_model_source(
 
     requested = str(adapter_checkpoint)
     checkpoint_root = _adapter_checkpoint_root(adapter_checkpoint)
+    from omnivoice.training.lora import read_lora_metadata
+
+    metadata = read_lora_metadata(checkpoint_root)
+    base_model_name = metadata.get("base_model_name_or_path")
+    if not isinstance(base_model_name, str) or not base_model_name.strip():
+        raise ValueError(
+            "LoRA metadata base_model_name_or_path must be a non-blank string"
+        )
+    revision = metadata.get("base_model_revision")
+    if revision is not None and (not isinstance(revision, str) or not revision.strip()):
+        raise ValueError("LoRA metadata base_model_revision must be a non-blank string")
+    resolver_kwargs = {"repo_id": base_model_name}
+    if revision is not None:
+        resolver_kwargs["revision"] = revision
+    base_snapshot = Path(snapshot_resolver(**resolver_kwargs)).resolve()
+    if not base_snapshot.is_dir() or not _HUB_COMMIT.fullmatch(base_snapshot.name):
+        raise ValueError(
+            "adapter base model did not resolve to an immutable Hub snapshot directory"
+        )
+    base_source = ModelSourceIdentity(
+        kind="base",
+        requested=base_model_name,
+        load_path=str(base_snapshot),
+        immutable_id=f"hf:{base_snapshot.name}",
+    )
     digest = adapter_fingerprinter(checkpoint_root)
     if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
         raise ValueError("adapter fingerprinter must return a lowercase SHA-256")
+    composite = _adapter_composite_sha256(digest, base_source)
     return ModelSourceIdentity(
         kind="adapter",
         requested=requested,
         load_path=str(checkpoint_root),
-        immutable_id=f"sha256:{digest}",
+        immutable_id=f"sha256:{composite}",
+        content_sha256=digest,
+        base_source=base_source,
     )
 
 
@@ -252,7 +359,9 @@ def load_assignment_manifest(path: str | Path) -> list[ValidationAssignment]:
                     object_pairs_hook=_reject_duplicate_members,
                 )
             except (json.JSONDecodeError, _StrictJsonError) as error:
-                detail = error.msg if isinstance(error, json.JSONDecodeError) else str(error)
+                detail = (
+                    error.msg if isinstance(error, json.JSONDecodeError) else str(error)
+                )
                 raise ValueError(
                     f"invalid assignment JSON on line {line_number}: {detail}"
                 ) from error
@@ -309,7 +418,7 @@ def load_validation_tts(
             raise ValueError("base snapshot identity no longer matches its load path")
     else:
         current_digest = adapter_fingerprinter(load_path)
-        if source_identity.immutable_id != f"sha256:{current_digest}":
+        if source_identity.content_sha256 != current_digest:
             raise ValueError("adapter checkpoint changed after identity resolution")
     if not torch_module.cuda.is_available():
         raise RuntimeError("CUDA is required for eight-rank validation synthesis")
@@ -325,7 +434,14 @@ def load_validation_tts(
     }
     if source_identity.kind == "base":
         return model_class.from_pretrained(str(load_path), **loader_kwargs)
-    return model_class.from_lora_pretrained(load_path, **loader_kwargs)
+    model = model_class.from_lora_pretrained(
+        load_path,
+        base_model_override=source_identity.base_source.load_path,
+        **loader_kwargs,
+    )
+    if adapter_fingerprinter(load_path) != source_identity.content_sha256:
+        raise ValueError("adapter checkpoint changed during model loading")
+    return model
 
 
 def initialize_distributed(
@@ -351,6 +467,7 @@ def synchronize_distributed(
     *,
     dist_module: Any = torch.distributed,
     timeout_seconds: float = 30.0,
+    destroy_timeout_seconds: float = 30.0,
 ) -> bool:
     """Attempt a bounded barrier and always tear down the process group."""
     if not dist_module.is_available() or not dist_module.is_initialized():
@@ -363,8 +480,12 @@ def synchronize_distributed(
         synchronized = False
     finally:
         try:
-            dist_module.destroy_process_group()
-        except RuntimeError:
+            run_bounded(
+                dist_module.destroy_process_group,
+                timeout_seconds=destroy_timeout_seconds,
+                description="distributed process-group cleanup",
+            )
+        except (RuntimeError, TimeoutError):
             synchronized = False
     return synchronized
 
@@ -453,7 +574,9 @@ def _record_is_resumable(
         "channels": 1,
         "source_identity": asdict(source_identity),
     }
-    if "error" in record or any(record.get(key) != value for key, value in expected.items()):
+    if "error" in record or any(
+        record.get(key) != value for key, value in expected.items()
+    ):
         return False
     return _valid_wav(wav_path, record.get("sha256"))
 
@@ -533,6 +656,35 @@ def write_synthesis_summary(
     path = step_dir / "rank-manifests" / f"rank-{summary.rank}.summary.json"
     _atomic_write_summary(path, summary)
     return path
+
+
+def read_synthesis_summary(
+    output_dir: str | Path | ValidationPaths, rank: int
+) -> SynthesisSummary | None:
+    """Read a previously published rank summary for lifecycle correction."""
+    path = _step_directory(output_dir) / "rank-manifests" / f"rank-{rank}.summary.json"
+    if not path.exists():
+        return None
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise TypeError("synthesis summary must be a JSON object")
+    values = dict(raw)
+    source = values.get("source_identity")
+    if not isinstance(source, dict):
+        raise TypeError("synthesis summary source_identity must be an object")
+    nested_base = source.get("base_source")
+    if nested_base is not None:
+        if not isinstance(nested_base, dict):
+            raise ValueError("adapter summary base_source must be an object")
+        source = dict(source)
+        source["base_source"] = ModelSourceIdentity(**nested_base)
+    values["source_identity"] = ModelSourceIdentity(**source)
+    error = values.get("error")
+    if error is not None:
+        if not isinstance(error, dict):
+            raise ValueError("synthesis summary error must be an object or null")
+        values["error"] = LifecycleError(**error)
+    return SynthesisSummary(**values)
 
 
 def _success_record(

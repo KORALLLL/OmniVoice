@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +21,7 @@ from omnivoice.validation.synthesis import (
     DistributedContext,
     ModelSourceIdentity,
     SynthesisSummary,
+    write_synthesis_summary,
 )
 
 
@@ -67,7 +72,10 @@ def test_synth_parser_requires_exactly_one_model_source(tmp_path: Path) -> None:
     ("source_args", "expected_source"),
     [
         ({"model": "k2-fsa/OmniVoice", "adapter_checkpoint": None}, "k2-fsa/OmniVoice"),
-        ({"model": None, "adapter_checkpoint": Path("checkpoint-625")}, "checkpoint-625"),
+        (
+            {"model": None, "adapter_checkpoint": Path("checkpoint-625")},
+            "checkpoint-625",
+        ),
     ],
 )
 def test_run_synth_forwards_source_and_returns_distinct_incomplete_code(
@@ -112,8 +120,9 @@ def test_run_synth_forwards_source_and_returns_distinct_incomplete_code(
         assignment_loader=lambda path: assignments,
         context_resolver=lambda: context,
         distributed_initializer=lambda context: None,
-        source_resolver=lambda **kwargs: calls.setdefault("source", kwargs)
-        and source_identity,
+        source_resolver=lambda **kwargs: (
+            calls.setdefault("source", kwargs) and source_identity
+        ),
         model_loader=model_loader,
         synthesizer=synthesizer,
         synchronizer=lambda: synchronized.append(True) or True,
@@ -251,7 +260,7 @@ def test_cleanup_failure_does_not_suppress_primary_synthesis_error(
 def test_sigterm_during_load_generation_sync_and_release_stays_incomplete(
     tmp_path: Path,
 ) -> None:
-    child = r'''
+    child = r"""
 import os
 import signal
 from pathlib import Path
@@ -329,7 +338,7 @@ for phase in ("load", "generation", "sync", "release"):
         cuda_releaser=release,
     )
     print(f"EXIT:{phase}:{code}")
-'''
+"""
     environment = {**__import__("os").environ, "SYNTH_SIGNAL_ROOT": str(tmp_path)}
 
     result = subprocess.run(
@@ -343,16 +352,16 @@ for phase in ("load", "generation", "sync", "release"):
     )
 
     assert result.returncode == 0, result.stderr
-    assert [line for line in result.stdout.splitlines() if line.startswith("EXIT:")] == [
+    assert [
+        line for line in result.stdout.splitlines() if line.startswith("EXIT:")
+    ] == [
         "EXIT:load:2",
         "EXIT:generation:2",
         "EXIT:sync:2",
         "EXIT:release:2",
     ]
     json_lines = [
-        json.loads(line)
-        for line in result.stdout.splitlines()
-        if line.startswith("{")
+        json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")
     ]
     assert len(json_lines) == 4
     assert all(row["complete"] is False for row in json_lines)
@@ -368,6 +377,68 @@ for phase in ("load", "generation", "sync", "release"):
             / "rank-0.summary.json"
         )
         assert json.loads(durable.read_text(encoding="utf-8"))["complete"] is False
+
+
+@pytest.mark.parametrize("signal_phase", ["serialize", "output"])
+def test_sigterm_during_final_payload_cannot_leave_success_authoritative(
+    tmp_path: Path,
+    signal_phase: str,
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run",
+        step=0,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source_identity = _source_identity(tmp_path)
+    summary = SynthesisSummary(
+        rank=0,
+        expected=250,
+        completed=250,
+        generated=250,
+        skipped=0,
+        failed=0,
+        complete=True,
+        stop_reason=None,
+        source_identity=source_identity,
+    )
+    emitted: list[str] = []
+    serialized = 0
+
+    def serializer(payload, **kwargs):
+        nonlocal serialized
+        serialized += 1
+        if signal_phase == "serialize" and serialized == 1:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return json.dumps(payload, **kwargs)
+
+    def output(payload: str) -> None:
+        emitted.append(payload)
+        if signal_phase == "output" and len(emitted) == 1:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    code = _run_synth(
+        args,
+        assignment_loader=lambda path: [],
+        context_resolver=lambda: DistributedContext(0, 0, 8),
+        source_resolver=lambda **kwargs: source_identity,
+        distributed_initializer=lambda context: None,
+        model_loader=lambda **kwargs: object(),
+        synthesizer=lambda **kwargs: summary,
+        synchronizer=lambda: True,
+        cuda_releaser=lambda: None,
+        serializer=serializer,
+        output=output,
+    )
+
+    assert code == INCOMPLETE_EXIT_CODE
+    assert json.loads(emitted[-1])["complete"] is False
+    assert json.loads(emitted[-1])["stop_reason"] == "signal"
+    durable = tmp_path / "run" / "step-0" / "rank-manifests" / "rank-0.summary.json"
+    assert json.loads(durable.read_text(encoding="utf-8"))["complete"] is False
 
 
 def test_unresolved_source_fails_before_model_loader_or_distributed_gpu_work(
@@ -400,3 +471,195 @@ def test_unresolved_source_fails_before_model_loader_or_distributed_gpu_work(
         )
 
     assert calls == ["release"]
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_reason"),
+    [("synchronization", "synchronization"), ("cleanup", "cleanup")],
+)
+def test_blocking_lifecycle_cleanup_is_bounded_and_corrects_summary(
+    tmp_path: Path, stage: str, expected_reason: str
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run",
+        step=0,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source_identity = _source_identity(tmp_path)
+    summary = SynthesisSummary(
+        rank=0,
+        expected=250,
+        completed=250,
+        generated=250,
+        skipped=0,
+        failed=0,
+        complete=True,
+        stop_reason=None,
+        source_identity=source_identity,
+    )
+    release = threading.Event()
+    timer = threading.Timer(0.5, release.set)
+
+    def block() -> bool:
+        release.wait()
+        return True
+
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match=expected_reason):
+            _run_synth(
+                args,
+                assignment_loader=lambda path: [],
+                context_resolver=lambda: DistributedContext(0, 0, 8),
+                source_resolver=lambda **kwargs: source_identity,
+                distributed_initializer=lambda context: None,
+                model_loader=lambda **kwargs: object(),
+                synthesizer=lambda **kwargs: summary,
+                synchronizer=block if stage == "synchronization" else lambda: True,
+                cuda_releaser=block if stage == "cleanup" else lambda: None,
+                cleanup_timeout_seconds=0.02,
+            )
+        assert time.monotonic() - started < 0.2
+    finally:
+        release.set()
+        timer.cancel()
+
+    durable = json.loads(
+        (
+            tmp_path / "run" / "step-0" / "rank-manifests" / "rank-0.summary.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert durable["complete"] is False
+    assert durable["stop_reason"] == expected_reason
+    assert durable["error"]["stage"] == expected_reason
+    assert durable["error"]["type"] == "TimeoutError"
+
+
+@pytest.mark.parametrize(
+    ("stage", "error"),
+    [
+        ("synchronization", ValueError("sync exploded")),
+        ("cleanup", OSError("release exploded")),
+    ],
+)
+def test_lifecycle_error_corrects_durable_summary_before_propagation(
+    tmp_path: Path, stage: str, error: BaseException
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run",
+        step=0,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source_identity = _source_identity(tmp_path)
+    summary = SynthesisSummary(
+        rank=0,
+        expected=250,
+        completed=250,
+        generated=250,
+        skipped=0,
+        failed=0,
+        complete=True,
+        stop_reason=None,
+        source_identity=source_identity,
+    )
+
+    with pytest.raises(type(error), match=str(error)):
+        _run_synth(
+            args,
+            assignment_loader=lambda path: [],
+            context_resolver=lambda: DistributedContext(0, 0, 8),
+            source_resolver=lambda **kwargs: source_identity,
+            distributed_initializer=lambda context: None,
+            model_loader=lambda **kwargs: object(),
+            synthesizer=lambda **kwargs: summary,
+            synchronizer=(
+                (lambda: (_ for _ in ()).throw(error))
+                if stage == "synchronization"
+                else lambda: True
+            ),
+            cuda_releaser=(
+                (lambda: (_ for _ in ()).throw(error))
+                if stage == "cleanup"
+                else lambda: None
+            ),
+        )
+
+    durable = json.loads(
+        (
+            tmp_path / "run" / "step-0" / "rank-manifests" / "rank-0.summary.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert durable["complete"] is False
+    assert durable["stop_reason"] == stage
+    assert durable["error"] == {
+        "stage": stage,
+        "type": type(error).__name__,
+        "message": str(error),
+    }
+
+
+def test_primary_error_still_corrects_summary_written_before_raise(
+    tmp_path: Path,
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run",
+        step=0,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source_identity = _source_identity(tmp_path)
+    summary = SynthesisSummary(
+        rank=0,
+        expected=250,
+        completed=250,
+        generated=250,
+        skipped=0,
+        failed=0,
+        complete=True,
+        stop_reason=None,
+        source_identity=source_identity,
+    )
+
+    def synthesize(**kwargs):
+        write_synthesis_summary(kwargs["output_dir"], summary)
+        raise RuntimeError("primary exploded after durable summary")
+
+    with pytest.raises(RuntimeError, match="primary exploded") as exc_info:
+        _run_synth(
+            args,
+            assignment_loader=lambda path: [],
+            context_resolver=lambda: DistributedContext(0, 0, 8),
+            source_resolver=lambda **kwargs: source_identity,
+            distributed_initializer=lambda context: None,
+            model_loader=lambda **kwargs: object(),
+            synthesizer=synthesize,
+            synchronizer=lambda: (_ for _ in ()).throw(
+                ValueError("sync also exploded")
+            ),
+            cuda_releaser=lambda: None,
+        )
+
+    durable = json.loads(
+        (
+            tmp_path / "run" / "step-0" / "rank-manifests" / "rank-0.summary.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert durable["complete"] is False
+    assert durable["stop_reason"] == "synchronization"
+    assert durable["error"]["type"] == "ValueError"
+    assert any(
+        "sync also exploded" in note
+        for note in getattr(exc_info.value, "__notes__", [])
+    )

@@ -392,8 +392,13 @@ class OmniVoice(PreTrainedModel):
         )
 
         metadata = read_lora_metadata(adapter_checkpoint)
+        base_model_override = kwargs.pop("base_model_override", None)
         base_model = cls.from_pretrained(
-            metadata["base_model_name_or_path"],
+            (
+                metadata["base_model_name_or_path"]
+                if base_model_override is None
+                else base_model_override
+            ),
             *args,
             **kwargs,
         )

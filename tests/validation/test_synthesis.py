@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -176,9 +178,10 @@ def test_synthesize_exact_stride_caches_prompts_and_resumes_valid_hashes(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    assert first_record["assignment_sha256"] == hashlib.sha256(
-        canonical_assignment
-    ).hexdigest()
+    assert (
+        first_record["assignment_sha256"]
+        == hashlib.sha256(canonical_assignment).hexdigest()
+    )
     assert first_record["source_identity"] == asdict(_source_identity(assignments))
 
     resumed_model = FakeModel()
@@ -258,9 +261,7 @@ def test_resume_rejects_one_field_assignment_provenance_corruption(
         "text": row.text,
         "voice_id": row.voice_id,
         "wav": str(wav),
-        "source_identity": asdict(
-            _source_identity(assignments, requested="base")
-        ),
+        "source_identity": asdict(_source_identity(assignments, requested="base")),
     }
     corrupted = deepcopy(record)
     if nested_field is None:
@@ -307,7 +308,9 @@ def test_one_assignment_provenance_corruption_regenerates_exactly_one(
     assert len(repair.generate_calls) == 1
 
 
-def test_changed_immutable_source_identity_regenerates(assignments, tmp_path: Path) -> None:
+def test_changed_immutable_source_identity_regenerates(
+    assignments, tmp_path: Path
+) -> None:
     synthesize_rank(
         assignments=assignments,
         model=FakeModel(),
@@ -339,7 +342,10 @@ def test_mutated_adapter_at_same_path_regenerates_and_unchanged_content_resumes(
     assignments, tmp_path: Path
 ) -> None:
     checkpoint = _adapter_checkpoint(tmp_path / "source")
-    first_source = resolve_model_source(adapter_checkpoint=checkpoint)
+    resolver = _snapshot_resolver(tmp_path / "base")
+    first_source = resolve_model_source(
+        adapter_checkpoint=checkpoint, snapshot_resolver=resolver
+    )
     output = tmp_path / "output"
     synthesize_rank(
         assignments=assignments,
@@ -357,14 +363,18 @@ def test_mutated_adapter_at_same_path_regenerates_and_unchanged_content_resumes(
         output_dir=output,
         rank=6,
         world_size=8,
-        source_identity=resolve_model_source(adapter_checkpoint=checkpoint),
+        source_identity=resolve_model_source(
+            adapter_checkpoint=checkpoint, snapshot_resolver=resolver
+        ),
     )
     assert (unchanged.generated, unchanged.skipped) == (0, 250)
 
     (checkpoint / "tokenizer.json").write_text(
         '{"vocab":{"mutated":1}}\n', encoding="utf-8"
     )
-    changed_source = resolve_model_source(adapter_checkpoint=checkpoint)
+    changed_source = resolve_model_source(
+        adapter_checkpoint=checkpoint, snapshot_resolver=resolver
+    )
     changed_model = FakeModel()
     changed = synthesize_rank(
         assignments=assignments,
@@ -398,9 +408,7 @@ def test_generation_error_is_atomic_and_retried_without_skipping(
         1,
         False,
     )
-    records = AtomicJsonlLedger(
-        tmp_path / "rank-manifests" / "rank-2.jsonl"
-    ).records
+    records = AtomicJsonlLedger(tmp_path / "rank-manifests" / "rank-2.jsonl").records
     error = next(record for record in records if "error" in record)
     assert error == {
         "checkpoint": "checkpoint-625",
@@ -556,10 +564,22 @@ def _adapter_checkpoint(root: Path) -> Path:
     (adapter / "adapter_config.json").write_text("{}\n", encoding="utf-8")
     (adapter / "adapter_model.safetensors").write_bytes(b"weights-v1")
     (checkpoint / "adapter_metadata.json").write_text(
-        '{"format_version":1}\n', encoding="utf-8"
+        '{"base_model_name_or_path":"k2-fsa/OmniVoice","format_version":1}\n',
+        encoding="utf-8",
     )
     (checkpoint / "tokenizer.json").write_text('{"vocab":{}}\n', encoding="utf-8")
     return checkpoint
+
+
+def _snapshot_resolver(root: Path, commit: str = "a" * 40):
+    snapshot = root / "snapshots" / commit
+    snapshot.mkdir(parents=True, exist_ok=True)
+
+    def resolve(**kwargs):
+        assert kwargs == {"repo_id": "k2-fsa/OmniVoice"}
+        return snapshot
+
+    return resolve
 
 
 @pytest.mark.parametrize(
@@ -585,18 +605,50 @@ def test_adapter_identity_fingerprints_every_recursive_checkpoint_file(
     assert len(before) == 64
 
 
-def test_adapter_source_uses_canonical_root_and_content_identity(tmp_path: Path) -> None:
+def test_adapter_source_uses_canonical_root_and_content_identity(
+    tmp_path: Path,
+) -> None:
     checkpoint = _adapter_checkpoint(tmp_path)
     digest = fingerprint_adapter_checkpoint(checkpoint)
+    resolver = _snapshot_resolver(tmp_path / "base")
 
-    source = resolve_model_source(adapter_checkpoint=checkpoint / "adapter")
-
-    assert source == ModelSourceIdentity(
-        kind="adapter",
-        requested=str(checkpoint / "adapter"),
-        load_path=str(checkpoint.resolve()),
-        immutable_id=f"sha256:{digest}",
+    source = resolve_model_source(
+        adapter_checkpoint=checkpoint / "adapter", snapshot_resolver=resolver
     )
+
+    assert source.kind == "adapter"
+    assert source.requested == str(checkpoint / "adapter")
+    assert source.load_path == str(checkpoint.resolve())
+    assert source.content_sha256 == digest
+    assert source.immutable_id.startswith("sha256:")
+    assert source.base_source == ModelSourceIdentity(
+        kind="base",
+        requested="k2-fsa/OmniVoice",
+        load_path=str((tmp_path / "base" / "snapshots" / ("a" * 40)).resolve()),
+        immutable_id=f"hf:{'a' * 40}",
+    )
+
+
+def test_adapter_identity_changes_when_recorded_base_snapshot_changes(
+    tmp_path: Path,
+) -> None:
+    checkpoint = _adapter_checkpoint(tmp_path / "adapter")
+    first = resolve_model_source(
+        adapter_checkpoint=checkpoint,
+        snapshot_resolver=_snapshot_resolver(tmp_path / "base-a", "a" * 40),
+    )
+    second = resolve_model_source(
+        adapter_checkpoint=checkpoint,
+        snapshot_resolver=_snapshot_resolver(tmp_path / "base-b", "b" * 40),
+    )
+
+    assert first.content_sha256 == second.content_sha256
+    assert first.base_source.immutable_id == f"hf:{'a' * 40}"
+    assert second.base_source.immutable_id == f"hf:{'b' * 40}"
+    assert first.immutable_id != second.immutable_id
+
+    with pytest.raises(ValueError, match="composite identity"):
+        replace(first, immutable_id=f"sha256:{'f' * 64}")
 
 
 def test_unresolved_base_and_malformed_adapter_fail_before_cuda(
@@ -662,7 +714,10 @@ def test_loader_binds_one_fp16_model_and_selects_exact_source(tmp_path: Path) ->
         torch_module=fake_torch,
     )
     checkpoint = _adapter_checkpoint(tmp_path)
-    adapter_source = resolve_model_source(adapter_checkpoint=checkpoint)
+    adapter_source = resolve_model_source(
+        adapter_checkpoint=checkpoint,
+        snapshot_resolver=_snapshot_resolver(tmp_path / "adapter-base"),
+    )
     load_validation_tts(
         source_identity=adapter_source,
         context=context,
@@ -680,14 +735,25 @@ def test_loader_binds_one_fp16_model_and_selects_exact_source(tmp_path: Path) ->
         (
             "adapter",
             checkpoint.resolve(),
-            {"device_map": "cuda:3", "dtype": torch.float16},
+            {
+                "base_model_override": str(
+                    (tmp_path / "adapter-base" / "snapshots" / ("a" * 40)).resolve()
+                ),
+                "device_map": "cuda:3",
+                "dtype": torch.float16,
+            },
         ),
     ]
 
 
-def test_loader_rechecks_adapter_fingerprint_before_touching_cuda(tmp_path: Path) -> None:
+def test_loader_rechecks_adapter_fingerprint_before_touching_cuda(
+    tmp_path: Path,
+) -> None:
     checkpoint = _adapter_checkpoint(tmp_path)
-    source = resolve_model_source(adapter_checkpoint=checkpoint)
+    source = resolve_model_source(
+        adapter_checkpoint=checkpoint,
+        snapshot_resolver=_snapshot_resolver(tmp_path / "base"),
+    )
     (checkpoint / "adapter" / "adapter_model.safetensors").write_bytes(
         b"mutated-after-resolution"
     )
@@ -703,6 +769,32 @@ def test_loader_rechecks_adapter_fingerprint_before_touching_cuda(tmp_path: Path
         )
 
     assert fake_cuda.devices == []
+
+
+def test_loader_rechecks_adapter_after_model_load(tmp_path: Path) -> None:
+    checkpoint = _adapter_checkpoint(tmp_path)
+    source = resolve_model_source(
+        adapter_checkpoint=checkpoint,
+        snapshot_resolver=_snapshot_resolver(tmp_path / "base"),
+    )
+
+    class MutatingOmniVoice:
+        @classmethod
+        def from_lora_pretrained(cls, source_path, **kwargs):
+            del kwargs
+            (Path(source_path) / "tokenizer.json").write_text(
+                '{"vocab":{"mutated":1}}\n', encoding="utf-8"
+            )
+            return object()
+
+    fake_torch = SimpleNamespace(cuda=_FakeCuda(), float16=torch.float16)
+    with pytest.raises(ValueError, match="changed during model loading"):
+        load_validation_tts(
+            source_identity=source,
+            context=DistributedContext(rank=0, local_rank=0, world_size=8),
+            model_class=MutatingOmniVoice,
+            torch_module=fake_torch,
+        )
 
 
 def test_rank_environment_is_strict_and_requires_eight_world_ranks() -> None:
@@ -775,3 +867,48 @@ def test_synchronization_requires_work_wait_to_return_exactly_true() -> None:
     dist = Dist()
     assert synchronize_distributed(dist_module=dist) is False
     assert dist.destroyed is True
+
+
+def test_destroy_process_group_timeout_is_bounded() -> None:
+    release = threading.Event()
+    timer = threading.Timer(0.5, release.set)
+
+    class Work:
+        @staticmethod
+        def wait(timeout):
+            del timeout
+            return True
+
+    class Dist:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def barrier(async_op):
+            assert async_op is True
+            return Work()
+
+        @staticmethod
+        def destroy_process_group():
+            release.wait()
+
+    timer.start()
+    started = time.monotonic()
+    try:
+        assert (
+            synchronize_distributed(
+                dist_module=Dist(),
+                timeout_seconds=0.01,
+                destroy_timeout_seconds=0.02,
+            )
+            is False
+        )
+        assert time.monotonic() - started < 0.2
+    finally:
+        release.set()
+        timer.cancel()
