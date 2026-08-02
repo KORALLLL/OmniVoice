@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright    2026  Xiaomi Corp.        (authors:  Han Zhu)
 #
 # See ../../LICENSE for clarification regarding multiple authors
@@ -24,7 +23,6 @@ in ``omnivoice.cli.train``.
 
 import json
 from dataclasses import asdict, dataclass, field
-from typing import List, Optional, Tuple
 
 from omnivoice.training.lora import DEFAULT_LORA_TARGET_MODULES
 
@@ -32,8 +30,8 @@ from omnivoice.training.lora import DEFAULT_LORA_TARGET_MODULES
 @dataclass
 class TrainingConfig:
     # Key Paths
-    output_dir: Optional[str] = None
-    data_config: Optional[str] = None
+    output_dir: str | None = None
+    data_config: str | None = None
 
     # Model Specific
     llm_name_or_path: str = "Qwen/Qwen3-0.6B"
@@ -42,20 +40,22 @@ class TrainingConfig:
     num_audio_codebook: int = 8
 
     # Model Training Specific
-    audio_codebook_weights: List[float | int] = field(
+    audio_codebook_weights: list[float | int] = field(
         default_factory=lambda: [8, 8, 6, 6, 4, 4, 2, 2]
     )
     drop_cond_ratio: float = 0.1
-    prompt_ratio_range: Tuple[float, float] = field(default_factory=lambda: (0.0, 0.3))
-    mask_ratio_range: Tuple[float, float] = field(default_factory=lambda: (0.0, 1.0))
+    prompt_ratio_range: tuple[float, float] = field(
+        default_factory=lambda: (0.0, 0.3)
+    )
+    mask_ratio_range: tuple[float, float] = field(default_factory=lambda: (0.0, 1.0))
     language_ratio: float = 0.8
     use_pinyin_ratio: float = 0.3
     instruct_ratio: float = 1.0
     only_instruct_ratio: float = 0.5
 
     # Init settings
-    resume_from_checkpoint: Optional[str] = None
-    init_from_checkpoint: Optional[str] = None
+    resume_from_checkpoint: str | None = None
+    init_from_checkpoint: str | None = None
 
     # LoRA fine-tuning
     lora_enabled: bool = False
@@ -72,6 +72,12 @@ class TrainingConfig:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     steps: int = 300000
+    steps_per_epoch: int | None = None
+    stop_after_step: int | None = None
+    max_wall_clock_seconds: float | None = None
+    early_stop_eval_loss: float | None = None
+    early_stop_patience: int = 1
+    eval_history_path: str | None = None
     seed: int = 42
     lr_scheduler_type: str = "cosine"
     warmup_type: str = "ratio"
@@ -87,7 +93,7 @@ class TrainingConfig:
     mixed_precision: str = "bf16"
     allow_tf32: bool = True
     use_deepspeed: bool = False
-    deepspeed_config: Optional[str] = None
+    deepspeed_config: str | None = None
     attn_implementation: str = "flex_attention"
 
     # Length-grouped batching (only used when attn_implementation != "flex_attention")
@@ -100,6 +106,23 @@ class TrainingConfig:
     eval_steps: int = 1000
     save_steps: int = 10000
     keep_last_n_checkpoints: int = -1
+
+    def validate(self):
+        """Validate bounded-training values before constructing the model."""
+        positive_values = (
+            ("steps", self.steps),
+            ("steps_per_epoch", self.steps_per_epoch),
+            ("stop_after_step", self.stop_after_step),
+            ("max_wall_clock_seconds", self.max_wall_clock_seconds),
+            ("early_stop_eval_loss", self.early_stop_eval_loss),
+            ("early_stop_patience", self.early_stop_patience),
+        )
+        for name, value in positive_values:
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.stop_after_step is not None and self.stop_after_step > self.steps:
+            raise ValueError("stop_after_step cannot exceed steps")
+        return self
 
     @classmethod
     def from_json(cls, json_path: str):

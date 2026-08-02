@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright    2026  Xiaomi Corp.        (authors:  Han Zhu)
 #
 # See ../../LICENSE for clarification regarding multiple authors
@@ -28,19 +27,30 @@ import os
 import sys
 import time
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.utils import DeepSpeedPlugin, InitProcessGroupKwargs, set_seed
+from accelerate.utils import (
+    DeepSpeedPlugin,
+    InitProcessGroupKwargs,
+    broadcast_object_list,
+    set_seed,
+)
 from torch.utils.data import DataLoader
 from transformers import (
-    get_cosine_schedule_with_warmup,
     get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
 )
 
 from omnivoice.training.checkpoint import TrainLogger, load_checkpoint
 from omnivoice.training.checkpoint import save_checkpoint as engine_save_checkpoint
+from omnivoice.training.control import (
+    EvaluationStopPolicy,
+    StopDecision,
+    TrainingOutcome,
+    append_loss_history,
+)
 from omnivoice.training.lora import register_lora_state_hooks
 
 logger = logging.getLogger(__name__)
@@ -60,10 +70,10 @@ class OmniTrainer:
         model: torch.nn.Module,
         config: Any,  # TrainingConfig
         train_dataloader: DataLoader,
-        eval_dataloader: Optional[DataLoader] = None,
-        tokenizer: Optional[Any] = None,
-        optimizer: Optional[torch.optim.Optimizer] = None,
-        lr_scheduler: Optional[Any] = None,
+        eval_dataloader: DataLoader | None = None,
+        tokenizer: Any | None = None,
+        optimizer: torch.optim.Optimizer | None = None,
+        lr_scheduler: Any | None = None,
     ):
         self.config = config
         self.model = model
@@ -250,12 +260,29 @@ class OmniTrainer:
         return eval_metrics
 
     def train(self):
-        """Main training loop."""
+        """Run one bounded training invocation against the total LR schedule."""
         logger.info("Starting Training Loop...")
+        invocation_start_time = time.monotonic()
+        invocation_stop = self.config.stop_after_step or self.config.steps
+        stop_policy = EvaluationStopPolicy(
+            threshold=self.config.early_stop_eval_loss,
+            patience=self.config.early_stop_patience,
+            wall_limit_seconds=self.config.max_wall_clock_seconds,
+        )
+        last_eval_loss = None
+        last_evaluated_step = None
+        stop_reason = None
 
         # Resume if configured
         if self.config.resume_from_checkpoint:
             self.load_checkpoint(self.config.resume_from_checkpoint)
+        if self.global_step > invocation_stop:
+            raise ValueError(
+                f"Resumed step {self.global_step} exceeds stop_after_step "
+                f"{invocation_stop}"
+            )
+        if self.config.steps_per_epoch is not None:
+            self.epoch = self.global_step // self.config.steps_per_epoch
 
         # Handle IterableDataset Epochs
         if hasattr(self.train_dataloader.dataset, "set_epoch"):
@@ -275,7 +302,43 @@ class OmniTrainer:
         tr_loss = torch.tensor(0.0).to(self.accelerator.device)
         logging_loss_scalar = 0.0
 
-        while self.global_step < self.config.steps:
+        def evaluate_and_decide():
+            nonlocal last_eval_loss, last_evaluated_step
+            metrics = self.evaluate()
+            last_evaluated_step = self.global_step
+            last_eval_loss = float(metrics["eval/loss"])
+            elapsed_seconds = time.monotonic() - invocation_start_time
+
+            payload = [None]
+            if self.accelerator.is_main_process:
+                try:
+                    if self.config.eval_history_path is not None:
+                        append_loss_history(
+                            self.config.eval_history_path,
+                            step=self.global_step,
+                            loss=last_eval_loss,
+                            elapsed_seconds=elapsed_seconds,
+                        )
+                    decision = stop_policy.observe(
+                        self.global_step, last_eval_loss, elapsed_seconds
+                    )
+                    payload[0] = (decision, None)
+                except BaseException as exc:  # noqa: BLE001
+                    payload[0] = (
+                        StopDecision(False, None, stop_policy.consecutive_hits),
+                        f"{type(exc).__name__}: {exc}",
+                    )
+
+            if self.accelerator.num_processes > 1:
+                payload = broadcast_object_list(payload)
+            decision, history_error = payload[0]
+            if history_error is not None:
+                raise RuntimeError(
+                    f"Failed to record evaluation history: {history_error}"
+                )
+            return decision
+
+        while self.global_step < invocation_stop:
             try:
                 batch = next(train_iterator)
             except StopIteration:
@@ -348,13 +411,53 @@ class OmniTrainer:
                         self.eval_dataloader is not None
                         and self.global_step % self.config.eval_steps == 0
                     ):
-                        self.evaluate()
+                        decision = evaluate_and_decide()
+                        if decision.stop:
+                            stop_reason = decision.reason
+                            break
+
+                    if self.global_step >= invocation_stop:
+                        if (
+                            self.eval_dataloader is not None
+                            and last_evaluated_step != self.global_step
+                        ):
+                            decision = evaluate_and_decide()
+                            if decision.stop:
+                                stop_reason = decision.reason
+                        if stop_reason is None:
+                            stop_reason = (
+                                "stop_after_step"
+                                if self.config.stop_after_step is not None
+                                else "completed"
+                            )
+                        break
 
                     # Save
                     if self.global_step % self.config.save_steps == 0:
                         self.save_checkpoint(self.global_step)
 
+        if stop_reason is None:
+            if (
+                self.eval_dataloader is not None
+                and last_evaluated_step != self.global_step
+            ):
+                decision = evaluate_and_decide()
+                if decision.stop:
+                    stop_reason = decision.reason
+            if stop_reason is None:
+                stop_reason = (
+                    "stop_after_step"
+                    if self.config.stop_after_step is not None
+                    else "completed"
+                )
+
         # Final Save
         self.save_checkpoint(self.global_step)
         train_logger.close()
         self.accelerator.end_training()
+        return TrainingOutcome(
+            step=self.global_step,
+            stop_reason=stop_reason,
+            last_eval_loss=last_eval_loss,
+            target_reached=stop_reason == "eval_loss_target",
+        )

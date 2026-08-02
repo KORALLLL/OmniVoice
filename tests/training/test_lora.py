@@ -7,6 +7,7 @@ from conftest import DummyTokenizer, ToyOmniVoice
 from omnivoice.training import builder
 from omnivoice.training.config import TrainingConfig
 from omnivoice.training.lora import apply_lora
+from omnivoice.training import trainer as trainer_module
 from omnivoice.training.trainer import OmniTrainer
 
 
@@ -154,3 +155,26 @@ def test_optimizer_contains_only_trainable_parameters(toy_omnivoice):
     optimizer_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
     expected_ids = {id(p) for p in model.parameters() if p.requires_grad}
     assert optimizer_ids == expected_ids
+
+
+def test_scheduler_uses_total_steps_not_invocation_bound(monkeypatch, toy_omnivoice):
+    captured = {}
+
+    class FakeScheduler:
+        pass
+
+    monkeypatch.setattr(
+        trainer_module,
+        "get_cosine_schedule_with_warmup",
+        lambda optimizer, num_warmup_steps, num_training_steps: (
+            captured.update(total=num_training_steps) or FakeScheduler()
+        ),
+    )
+    config = TrainingConfig(steps=5000, stop_after_step=625)
+    trainer = object.__new__(OmniTrainer)
+    trainer.model = toy_omnivoice
+    trainer.config = config
+
+    trainer.create_optimizer_and_scheduler()
+
+    assert captured["total"] == 5000

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright    2026  Xiaomi Corp.        (authors:  Han Zhu)
 #
 # See ../../LICENSE for clarification regarding multiple authors
@@ -31,6 +30,8 @@ See examples/run_emilia.sh and examples/run_finetune.sh for full pipelines.
 """
 
 import argparse
+import json
+from dataclasses import asdict
 
 from omnivoice.training.builder import build_dataloaders, build_model_and_tokenizer
 from omnivoice.training.config import TrainingConfig
@@ -48,12 +49,19 @@ def main():
     parser.add_argument(
         "--data_config", type=str, required=True, help="Path to data config JSON"
     )
+    parser.add_argument("--stop-after-step", type=int)
+    parser.add_argument("--resume-from-checkpoint")
     args = parser.parse_args()
 
     # 1. Load Configuration
     config = TrainingConfig.from_json(args.train_config)
     config.output_dir = args.output_dir
     config.data_config = args.data_config
+    if args.stop_after_step is not None:
+        config.stop_after_step = args.stop_after_step
+    if args.resume_from_checkpoint is not None:
+        config.resume_from_checkpoint = args.resume_from_checkpoint
+    config.validate()
 
     # 2. Build Components
     model, tokenizer = build_model_and_tokenizer(config)
@@ -67,7 +75,9 @@ def main():
         eval_dataloader=eval_loader,
         tokenizer=tokenizer,
     )
-    trainer.train()
+    outcome = trainer.train()
+    if trainer.accelerator.is_main_process:
+        print(json.dumps(asdict(outcome), sort_keys=True))
 
 
 if __name__ == "__main__":
