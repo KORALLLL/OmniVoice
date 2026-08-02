@@ -151,6 +151,131 @@ def test_failed_rewrite_preserves_valid_existing_artifact(tmp_path: Path) -> Non
     assert list(tmp_path.glob(".rank-0.jsonl.*.tmp")) == []
 
 
+@pytest.mark.parametrize("failure_operation", ["fsync", "open", "close"])
+def test_post_replace_durability_failure_keeps_memory_aligned_with_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_operation: str,
+) -> None:
+    ledger_path = tmp_path / "rank-0.jsonl"
+    ledger = AtomicJsonlLedger(ledger_path)
+    ledger.upsert({"id": "1", "hypothesis": "one"})
+    replaced = False
+    real_fsync = os.fsync
+    real_open = os.open
+    real_close = os.close
+    real_replace = os.replace
+
+    def track_replace(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
+        nonlocal replaced
+        real_replace(source, destination)
+        replaced = True
+
+    def fail_fsync_after_replace(fd: int) -> None:
+        if replaced and failure_operation == "fsync":
+            raise OSError("injected directory fsync failure")
+        real_fsync(fd)
+
+    def fail_open_after_replace(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        if replaced and failure_operation == "open":
+            raise OSError("injected directory open failure")
+        return real_open(path, flags, mode)
+
+    def fail_close_after_replace(fd: int) -> None:
+        real_close(fd)
+        if replaced and failure_operation == "close":
+            raise OSError("injected directory close failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", track_replace)
+        patch.setattr(os, "fsync", fail_fsync_after_replace)
+        patch.setattr(os, "open", fail_open_after_replace)
+        patch.setattr(os, "close", fail_close_after_replace)
+        with pytest.raises(OSError, match=f"injected directory {failure_operation}"):
+            ledger.upsert({"id": "2", "hypothesis": "two"})
+
+    assert [record["id"] for record in ledger.records] == ["1", "2"]
+    assert [record["id"] for record in AtomicJsonlLedger(ledger_path).records] == [
+        "1",
+        "2",
+    ]
+
+    ledger.upsert({"id": "3", "hypothesis": "three"})
+
+    assert [record["id"] for record in AtomicJsonlLedger(ledger_path).records] == [
+        "1",
+        "2",
+        "3",
+    ]
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_existing_ledger_rejects_non_finite_json_constants(
+    tmp_path: Path, constant: str
+) -> None:
+    ledger_path = tmp_path / "rank-0.jsonl"
+    original = f'{{"id":"bad","value":{constant}}}\n'.encode()
+    ledger_path.write_bytes(original)
+
+    with pytest.raises(ValueError, match=r"invalid JSON.*non-finite"):
+        AtomicJsonlLedger(ledger_path)
+
+    assert ledger_path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    ("raw", "duplicate_member"),
+    [
+        ('{"id":"first","id":"second","hypothesis":"ok"}\n', "id"),
+        ('{"id":"one","metadata":{"value":1,"value":2}}\n', "value"),
+    ],
+)
+def test_existing_ledger_rejects_duplicate_json_object_members(
+    tmp_path: Path, raw: str, duplicate_member: str
+) -> None:
+    ledger_path = tmp_path / "rank-0.jsonl"
+    original = raw.encode()
+    ledger_path.write_bytes(original)
+
+    with pytest.raises(
+        ValueError, match=rf"invalid JSON.*duplicate object member {duplicate_member!r}"
+    ):
+        AtomicJsonlLedger(ledger_path)
+
+    assert ledger_path.read_bytes() == original
+
+
+def test_upsert_copies_nested_caller_values_before_storing(tmp_path: Path) -> None:
+    ledger = AtomicJsonlLedger(tmp_path / "rank-0.jsonl")
+    record = {"id": "1", "metadata": {"tokens": ["original"]}}
+
+    ledger.upsert(record)
+    record["metadata"]["tokens"].append("caller mutation")  # type: ignore[index]
+
+    assert ledger.records == [
+        {"id": "1", "metadata": {"tokens": ["original"]}}
+    ]
+
+
+def test_records_returns_nested_values_isolated_from_ledger_state(tmp_path: Path) -> None:
+    ledger = AtomicJsonlLedger(tmp_path / "rank-0.jsonl")
+    ledger.upsert({"id": "1", "metadata": {"tokens": ["original"]}})
+
+    returned = ledger.records
+    returned[0]["metadata"]["tokens"].append("consumer mutation")
+
+    assert ledger.records == [
+        {"id": "1", "metadata": {"tokens": ["original"]}}
+    ]
+
+
 def test_merge_detects_cross_rank_duplicates_before_dict_collapse(tmp_path: Path) -> None:
     rank_zero = tmp_path / "rank-0.jsonl"
     rank_one = tmp_path / "rank-1.jsonl"

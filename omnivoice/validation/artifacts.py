@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -16,6 +17,25 @@ _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
+class _StrictJsonError(ValueError):
+    pass
+
+
+def _reject_non_finite_json(value: str) -> None:
+    raise _StrictJsonError(f"non-finite JSON constant {value!r}")
+
+
+def _reject_duplicate_json_members(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for field, value in pairs:
+        if field in result:
+            raise _StrictJsonError(f"duplicate object member {field!r}")
+        result[field] = value
+    return result
+
+
 def _require_key(record: Mapping[str, Any], key: str, context: str) -> str:
     value = record.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -24,7 +44,7 @@ def _require_key(record: Mapping[str, Any], key: str, context: str) -> str:
 
 
 def _canonical_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    return {field: record[field] for field in sorted(record)}
+    return {field: copy.deepcopy(record[field]) for field in sorted(record)}
 
 
 def _atomic_write_jsonl(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
@@ -69,10 +89,17 @@ def _load_jsonl(path: Path, key: str) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as source:
         for line_number, line in enumerate(source, start=1):
             try:
-                raw = json.loads(line)
-            except json.JSONDecodeError as error:
+                raw = json.loads(
+                    line,
+                    parse_constant=_reject_non_finite_json,
+                    object_pairs_hook=_reject_duplicate_json_members,
+                )
+            except (json.JSONDecodeError, _StrictJsonError) as error:
+                details = (
+                    error.msg if isinstance(error, json.JSONDecodeError) else str(error)
+                )
                 raise ValueError(
-                    f"invalid JSON in {path} on line {line_number}: {error.msg}"
+                    f"invalid JSON in {path} on line {line_number}: {details}"
                 ) from error
             if not isinstance(raw, dict):
                 raise TypeError(
@@ -142,7 +169,11 @@ def valid_completed_ids(
 
 
 class AtomicJsonlLedger:
-    """A JSONL ledger rewritten atomically after each keyed update."""
+    """A JSONL ledger rewritten atomically after each keyed update.
+
+    Each rank-local ledger is owned by one writer process. Cross-process locking is
+    intentionally outside this validation artifact contract.
+    """
 
     def __init__(self, path: str | Path, key: str = "id") -> None:
         self.path = Path(path)
@@ -155,7 +186,7 @@ class AtomicJsonlLedger:
     @property
     def records(self) -> list[dict[str, Any]]:
         """Return canonical records ordered by the ledger key."""
-        return [dict(self._records[value]) for value in sorted(self._records)]
+        return [copy.deepcopy(self._records[value]) for value in sorted(self._records)]
 
     def upsert(self, record: Mapping[str, Any]) -> None:
         """Atomically insert or replace one record without risking the old file."""
@@ -165,7 +196,12 @@ class AtomicJsonlLedger:
         replacement = dict(self._records)
         replacement[identifier] = _canonical_record(record)
         ordered = [replacement[value] for value in sorted(replacement)]
-        _atomic_write_jsonl(self.path, ordered)
+        try:
+            _atomic_write_jsonl(self.path, ordered)
+        except BaseException:
+            loaded = _load_jsonl(self.path, self.key)
+            self._records = {item[self.key]: item for item in loaded}
+            raise
         self._records = replacement
 
     def successful_ids(self, required_files: Sequence[str] = ()) -> set[str]:
