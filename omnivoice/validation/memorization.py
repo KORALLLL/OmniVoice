@@ -518,18 +518,13 @@ def _read_selected_rows(path: Path) -> list[SelectedBalalaikaClip]:
             raise ValueError("source_shard does not match source_relative_path")
         if row.member_name != source_match.group("member"):
             raise ValueError("member_name does not match source_relative_path")
-    schema_versions = [row.schema_version for row in rows]
     source_paths = [row.source_relative_path for row in rows]
-    member_names = [row.member_name for row in rows]
     audio_paths = [str(Path(row.audio_path).resolve()) for row in rows]
     artifact_ids = [_clip_id(row, index) for index, row in enumerate(rows)]
     source_hashes = [row.source_sha256 for row in rows]
     wav_hashes = [row.wav_sha256 for row in rows]
-    if len(set(schema_versions)) != 1:
-        raise ValueError("schema_version must be consistent across selected rows")
     if (
         len(set(source_paths)) != 4
-        or len(set(member_names)) != 4
         or len(set(audio_paths)) != 4
         or len(set(artifact_ids)) != 4
         or len(set(source_hashes)) != 4

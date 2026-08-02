@@ -763,7 +763,6 @@ def test_process_group_timeout_kills_pipe_holding_grandchild(tmp_path):
     [
         ("source_relative_path", " ", "source_relative_path"),
         ("schema_version", True, "schema_version"),
-        ("schema_version", 2, "schema_version"),
         ("duration_tier", "wrong", "duration_tier"),
         ("sample_rate", True, "sample_rate"),
         ("channels", 2, "channels"),
@@ -787,6 +786,41 @@ def test_selected_manifest_rejects_invalid_consumed_metadata(
             model_loader=lambda **kwargs: FakeModel([]),
             generation_runner=_direct_generation_runner,
         )
+
+
+def test_selected_manifest_accepts_shard_qualified_member_and_schema_versions(
+    tmp_path,
+):
+    manifest, rows = _selected_manifest(tmp_path)
+    rows[1] = SelectedBalalaikaClip(
+        **(
+            asdict(rows[1])
+            | {
+                "source_relative_path": "000002/0.mp3",
+                "source_shard": "train/shard_000002.tar",
+                "member_name": "0.mp3",
+                "schema_version": 2,
+            }
+        )
+    )
+    _rewrite_manifest(manifest, rows)
+    train_config, data_config = _write_configs(tmp_path)
+    output_dir = tmp_path / "exp"
+    runner, loader, _, _, _ = _fake_dependencies(
+        output_dir, [2e-4, 9e-5, 8e-5], "eval_loss_target"
+    )
+
+    result = run_memorization(
+        selected_manifest=manifest,
+        output_dir=output_dir,
+        train_config=train_config,
+        data_config=data_config,
+        command_runner=runner,
+        model_loader=loader,
+        generation_runner=_direct_generation_runner,
+    )
+
+    assert result.required_target_reached is True
 
 
 @pytest.mark.parametrize("hash_field", ["source_sha256", "wav_sha256"])
