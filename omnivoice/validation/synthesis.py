@@ -667,7 +667,11 @@ def read_synthesis_summary(
     path = _step_directory(output_dir) / "rank-manifests" / f"rank-{rank}.summary.json"
     if not path.exists():
         return None
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = json.loads(
+        path.read_text(encoding="utf-8"),
+        parse_constant=_reject_constant,
+        object_pairs_hook=_reject_duplicate_members,
+    )
     if not isinstance(raw, dict):
         raise TypeError("synthesis summary must be a JSON object")
     values = dict(raw)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import json
 import os
 import signal
@@ -26,15 +27,19 @@ from omnivoice.validation.synthesis import (
     write_synthesis_summary,
 )
 
+_EXCEPTION_GROUP = builtins.ExceptionGroup
 
-def _source_identity(tmp_path: Path, *, requested: str = "base") -> ModelSourceIdentity:
+
+def _source_identity(
+    tmp_path: Path, *, requested: str = "base", commit: str = "a" * 40
+) -> ModelSourceIdentity:
     source = tmp_path / "immutable-source"
     source.mkdir(parents=True, exist_ok=True)
     return ModelSourceIdentity(
         kind="base",
         requested=requested,
         load_path=str(source.resolve()),
-        immutable_id=f"hf:{'a' * 40}",
+        immutable_id=f"hf:{commit}",
     )
 
 
@@ -604,6 +609,8 @@ def test_blocking_lifecycle_cleanup_is_bounded_and_corrects_summary(
         "cleanup",
         "error_destructor",
         "error_sync",
+        "error_cause_destructor",
+        "partial_loader",
     ],
 )
 def test_real_rank_process_hard_exits_with_no_abandoned_worker_progress(
@@ -655,10 +662,29 @@ class BlockingDestructor:
         block()
 
 def synthesize(**kwargs):
+    if stage == "error_cause_destructor":
+        def raise_nested(model):
+            try:
+                raise KeyError("nested cause")
+            except KeyError as cause:
+                assert model is not None
+                raise ValueError("primary caused synthesis exploded") from cause
+
+        raise_nested(kwargs["model"])
     if stage.startswith("error_"):
         assert kwargs["model"] is not None
         raise ValueError("primary synthesis exploded")
     return summary
+
+def load_model(**kwargs):
+    del kwargs
+    if stage == "partial_loader":
+        partial_model = BlockingDestructor()
+        assert partial_model is not None
+        raise RuntimeError("partial loader exploded")
+    if stage in {"destructor", "error_destructor", "error_cause_destructor"}:
+        return BlockingDestructor()
+    return object()
 
 args = SimpleNamespace(
     assignments=root / "assignments.jsonl",
@@ -676,11 +702,7 @@ _run_synth(
     context_resolver=lambda: DistributedContext(0, 0, 8),
     source_resolver=lambda **kwargs: source_identity,
     distributed_initializer=lambda context: None,
-    model_loader=lambda **kwargs: (
-        BlockingDestructor()
-        if stage in {"destructor", "error_destructor"}
-        else object()
-    ),
+    model_loader=load_model,
     synthesizer=synthesize,
     synchronizer=(
         block if stage in {"synchronization", "error_sync"} else lambda: True
@@ -724,12 +746,25 @@ _run_synth(
     assert payloads[0]["stop_reason"] == (
         "synchronization" if stage in {"synchronization", "error_sync"} else "cleanup"
     )
-    if stage.startswith("error_"):
-        assert payloads[0]["primary_error"] == {
-            "stage": "synthesis",
-            "type": "ValueError",
-            "message": "primary synthesis exploded",
-        }
+    if stage.startswith("error_") or stage == "partial_loader":
+        expected_primary = (
+            {
+                "stage": "model_load",
+                "type": "RuntimeError",
+                "message": "partial loader exploded",
+            }
+            if stage == "partial_loader"
+            else {
+                "stage": "synthesis",
+                "type": "ValueError",
+                "message": (
+                    "primary caused synthesis exploded"
+                    if stage == "error_cause_destructor"
+                    else "primary synthesis exploded"
+                ),
+            }
+        )
+        assert payloads[0]["primary_error"] == expected_primary
         assert payloads[0]["cleanup_error"]["type"] == "TimeoutError"
         assert payloads[0]["completed"] is None
     durable = json.loads(
@@ -923,6 +958,142 @@ def test_primary_traceback_releases_model_inside_bounded_cleanup(
     )
 
 
+@pytest.mark.parametrize("graph_kind", ["cause", "context", "group", "cycle"])
+def test_nested_primary_exception_graph_releases_model_in_cleanup_worker(
+    tmp_path: Path, graph_kind: str
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run",
+        step=8,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source_identity = _source_identity(tmp_path)
+    destructor_threads: list[int] = []
+    release_threads: list[int] = []
+
+    class TrackedModel:
+        def __del__(self):
+            destructor_threads.append(threading.get_ident())
+
+    def nested_helper(model) -> None:
+        assert isinstance(model, TrackedModel)
+        raise KeyError("nested retains model")
+
+    def synthesize_nested(**kwargs):
+        try:
+            nested_helper(kwargs["model"])
+        except KeyError as nested:
+            if graph_kind == "cause":
+                raise ValueError("outer cause") from nested
+            if graph_kind == "context":
+                raise ValueError("outer context")
+            if graph_kind == "group":
+                raise _EXCEPTION_GROUP("outer group", [nested])
+            outer = ValueError("outer cycle")
+            outer.__cause__ = nested
+            nested.__cause__ = outer
+            raise outer
+
+    def release() -> None:
+        release_threads.append(threading.get_ident())
+
+    expected_type = _EXCEPTION_GROUP if graph_kind == "group" else ValueError
+    with pytest.raises(expected_type) as exc_info:
+        _run_synth(
+            args,
+            assignment_loader=lambda path: [],
+            context_resolver=lambda: DistributedContext(0, 0, 8),
+            source_resolver=lambda **kwargs: source_identity,
+            distributed_initializer=lambda context: None,
+            model_loader=lambda **kwargs: TrackedModel(),
+            synthesizer=synthesize_nested,
+            synchronizer=lambda: True,
+            cuda_releaser=release,
+        )
+
+    assert len(destructor_threads) == 1
+    assert destructor_threads == release_threads
+    assert destructor_threads[0] != threading.get_ident()
+    traceback_names: list[str] = []
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        traceback_names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    assert "synthesize_nested" in traceback_names
+    if graph_kind == "group":
+        nested_error = exc_info.value.exceptions[0]
+    elif graph_kind == "context":
+        nested_error = exc_info.value.__context__
+    else:
+        nested_error = exc_info.value.__cause__
+    assert isinstance(nested_error, KeyError)
+    if graph_kind == "cycle":
+        assert nested_error.__cause__ is exc_info.value
+    nested_traceback_names: list[str] = []
+    nested_traceback = nested_error.__traceback__
+    while nested_traceback is not None:
+        nested_traceback_names.append(nested_traceback.tb_frame.f_code.co_name)
+        nested_traceback = nested_traceback.tb_next
+    assert "nested_helper" in nested_traceback_names
+
+
+def test_partial_model_loader_failure_destroys_model_in_cleanup_worker(
+    tmp_path: Path,
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run",
+        step=9,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source_identity = _source_identity(tmp_path)
+    destructor_threads: list[int] = []
+    release_threads: list[int] = []
+
+    class PartialModel:
+        def __del__(self):
+            destructor_threads.append(threading.get_ident())
+
+    def failing_loader(**kwargs):
+        del kwargs
+        partial_model = PartialModel()
+        assert partial_model is not None
+        raise RuntimeError("partial loader exploded")
+
+    def release() -> None:
+        release_threads.append(threading.get_ident())
+
+    with pytest.raises(RuntimeError, match="partial loader exploded") as exc_info:
+        _run_synth(
+            args,
+            assignment_loader=lambda path: [],
+            context_resolver=lambda: DistributedContext(0, 0, 8),
+            source_resolver=lambda **kwargs: source_identity,
+            distributed_initializer=lambda context: None,
+            model_loader=failing_loader,
+            synthesizer=lambda **kwargs: None,
+            synchronizer=lambda: True,
+            cuda_releaser=release,
+        )
+
+    assert len(destructor_threads) == 1
+    assert destructor_threads == release_threads
+    assert destructor_threads[0] != threading.get_ident()
+    traceback_names: list[str] = []
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        traceback_names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    assert "failing_loader" in traceback_names
+
+
 def test_primary_without_summary_is_published_before_sync_timeout(
     tmp_path: Path,
 ) -> None:
@@ -1005,3 +1176,202 @@ def test_primary_without_summary_is_published_before_sync_timeout(
     }
     restored = read_synthesis_summary(tmp_path / "run-failure" / "step-13", rank=0)
     assert asdict(restored) == durable
+
+
+def test_stale_source_summary_cannot_claim_coverage_after_current_timeout(
+    tmp_path: Path,
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run-source-b",
+        step=21,
+        model="base-b",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source_a = _source_identity(
+        tmp_path / "source-a", requested="base-a", commit="a" * 40
+    )
+    source_b = _source_identity(
+        tmp_path / "source-b", requested="base-b", commit="b" * 40
+    )
+    prior = SynthesisSummary(
+        rank=0,
+        expected=250,
+        completed=250,
+        generated=250,
+        skipped=0,
+        failed=0,
+        complete=True,
+        stop_reason=None,
+        source_identity=source_a,
+        run_id=args.run_id,
+        step=args.step,
+    )
+    write_synthesis_summary(tmp_path / args.run_id / "step-21", prior)
+    release = threading.Event()
+    emitted: list[str] = []
+
+    class HardExit(BaseException):
+        pass
+
+    try:
+        with pytest.raises(HardExit):
+            _run_synth(
+                args,
+                assignment_loader=lambda path: [object()] * 2_000,
+                context_resolver=lambda: DistributedContext(0, 0, 8),
+                source_resolver=lambda **kwargs: source_b,
+                distributed_initializer=lambda context: None,
+                model_loader=lambda **kwargs: (_ for _ in ()).throw(
+                    ValueError("base-b load exploded")
+                ),
+                synthesizer=lambda **kwargs: None,
+                synchronizer=lambda: release.wait() or True,
+                cuda_releaser=lambda: (_ for _ in ()).throw(
+                    AssertionError("release must not run after sync timeout")
+                ),
+                cleanup_timeout_seconds=0.02,
+                hard_exit=lambda code: (_ for _ in ()).throw(HardExit(code)),
+                output=emitted.append,
+            )
+    finally:
+        release.set()
+
+    assert len(emitted) == 1
+    payload = json.loads(emitted[0])
+    assert payload["source_identity"] == asdict(source_b)
+    assert payload["expected"] == 250
+    assert payload["completed"] is None
+    assert payload["generated"] is None
+    assert payload["skipped"] is None
+    assert payload["failed"] is None
+    assert payload["complete"] is False
+    assert payload["primary_error"] == {
+        "stage": "model_load",
+        "type": "ValueError",
+        "message": "base-b load exploded",
+    }
+    assert payload["cleanup_error"]["stage"] == "synchronization"
+    durable = read_synthesis_summary(tmp_path / "run-source-b" / "step-21", rank=0)
+    assert durable.source_identity == source_b
+    assert durable.completed is None
+    assert durable.primary_error.message == "base-b load exploded"
+    assert durable.cleanup_error.stage == "synchronization"
+
+
+def test_exact_same_source_prior_summary_reuses_known_counts(tmp_path: Path) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="same-source",
+        step=22,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source = _source_identity(tmp_path)
+    prior = SynthesisSummary(
+        rank=0,
+        expected=250,
+        completed=123,
+        generated=123,
+        skipped=0,
+        failed=0,
+        complete=False,
+        stop_reason="deadline",
+        source_identity=source,
+        run_id=args.run_id,
+        step=args.step,
+    )
+    write_synthesis_summary(tmp_path / args.run_id / "step-22", prior)
+
+    with pytest.raises(ValueError, match="same source load exploded"):
+        _run_synth(
+            args,
+            assignment_loader=lambda path: [object()] * 2_000,
+            context_resolver=lambda: DistributedContext(0, 0, 8),
+            source_resolver=lambda **kwargs: source,
+            distributed_initializer=lambda context: None,
+            model_loader=lambda **kwargs: (_ for _ in ()).throw(
+                ValueError("same source load exploded")
+            ),
+            synthesizer=lambda **kwargs: None,
+            synchronizer=lambda: True,
+            cuda_releaser=lambda: None,
+        )
+
+    durable = read_synthesis_summary(tmp_path / "same-source" / "step-22", rank=0)
+    assert (durable.expected, durable.completed, durable.generated) == (250, 123, 123)
+    assert durable.source_identity == source
+    assert durable.primary_error.message == "same source load exploded"
+
+
+@pytest.mark.parametrize("stale_field", ["run_id", "step", "rank", "malformed"])
+def test_stale_or_malformed_summary_is_ignored_for_current_fallback(
+    tmp_path: Path, stale_field: str
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="current-run",
+        step=23,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source = _source_identity(tmp_path)
+    summary_path = (
+        tmp_path / "current-run" / "step-23" / "rank-manifests" / "rank-0.summary.json"
+    )
+    summary_path.parent.mkdir(parents=True)
+    if stale_field == "malformed":
+        summary_path.write_text("{not-json\n", encoding="utf-8")
+    else:
+        values = asdict(
+            SynthesisSummary(
+                rank=0,
+                expected=250,
+                completed=250,
+                generated=250,
+                skipped=0,
+                failed=0,
+                complete=True,
+                stop_reason=None,
+                source_identity=source,
+                run_id=args.run_id,
+                step=args.step,
+            )
+        )
+        values[stale_field] = {
+            "run_id": "other-run",
+            "step": 999,
+            "rank": 1,
+        }[stale_field]
+        summary_path.write_text(json.dumps(values) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="current load exploded"):
+        _run_synth(
+            args,
+            assignment_loader=lambda path: [object()] * 2_000,
+            context_resolver=lambda: DistributedContext(0, 0, 8),
+            source_resolver=lambda **kwargs: source,
+            distributed_initializer=lambda context: None,
+            model_loader=lambda **kwargs: (_ for _ in ()).throw(
+                ValueError("current load exploded")
+            ),
+            synthesizer=lambda **kwargs: None,
+            synchronizer=lambda: True,
+            cuda_releaser=lambda: None,
+        )
+
+    durable = read_synthesis_summary(tmp_path / "current-run" / "step-23", rank=0)
+    assert durable.run_id == args.run_id
+    assert durable.step == args.step
+    assert durable.rank == 0
+    assert durable.source_identity == source
+    assert durable.expected == 250
+    assert durable.completed is None
+    assert durable.cleanup_error is None
+    assert durable.primary_error.message == "current load exploded"

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import json
 import math
 import os
 import signal
+import sys
 import threading
 import time
-import traceback as traceback_module
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -34,10 +35,117 @@ from omnivoice.validation.synthesis import (
 )
 
 INCOMPLETE_EXIT_CODE = 2
+_BASE_EXCEPTION_GROUP = builtins.__dict__.get("BaseExceptionGroup", ())
 
 
 def _output_json(payload: str) -> None:
     print(payload, flush=True)
+
+
+def _clear_completed_exception_graph_frames(error: BaseException) -> None:
+    """Clear completed traceback frames across a cycle-safe exception graph."""
+    active_frames: set[int] = set()
+    for frame in sys._current_frames().values():
+        while frame is not None:
+            active_frames.add(id(frame))
+            frame = frame.f_back
+
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback = current.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if id(frame) not in active_frames:
+                frame.clear()
+            traceback = traceback.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if isinstance(current, _BASE_EXCEPTION_GROUP):
+            pending.extend(current.exceptions)
+
+
+def _valid_lifecycle_detail(detail: LifecycleError | None) -> bool:
+    return detail is None or (
+        isinstance(detail, LifecycleError)
+        and isinstance(detail.stage, str)
+        and bool(detail.stage.strip())
+        and isinstance(detail.type, str)
+        and bool(detail.type.strip())
+        and isinstance(detail.message, str)
+    )
+
+
+def _summary_matches_current_context(
+    summary: Any,
+    *,
+    run_id: str,
+    step: int,
+    rank: int,
+    source_identity: Any,
+) -> bool:
+    if (
+        not isinstance(summary, SynthesisSummary)
+        or summary.run_id != run_id
+        or summary.step != step
+        or summary.rank != rank
+        or summary.source_identity != source_identity
+        or type(summary.complete) is not bool
+        or not (
+            summary.stop_reason is None
+            or (
+                isinstance(summary.stop_reason, str)
+                and bool(summary.stop_reason.strip())
+            )
+        )
+        or not all(
+            _valid_lifecycle_detail(detail)
+            for detail in (
+                summary.error,
+                summary.primary_error,
+                summary.cleanup_error,
+            )
+        )
+    ):
+        return False
+    counts = (
+        summary.expected,
+        summary.completed,
+        summary.generated,
+        summary.skipped,
+        summary.failed,
+    )
+    if any(
+        value is not None and (type(value) is not int or value < 0) for value in counts
+    ):
+        return False
+    if (
+        summary.expected is not None
+        and summary.completed is not None
+        and summary.completed > summary.expected
+    ):
+        return False
+    if (
+        summary.completed is not None
+        and summary.generated is not None
+        and summary.skipped is not None
+        and summary.generated + summary.skipped != summary.completed
+    ):
+        return False
+    return not summary.complete or (
+        summary.expected is not None
+        and summary.completed == summary.expected
+        and summary.failed == 0
+        and summary.error is None
+        and summary.primary_error is None
+        and summary.cleanup_error is None
+    )
 
 
 def _finite_float(value: str) -> float:
@@ -172,12 +280,22 @@ def _run_synth(
         except BaseException as error:  # noqa: BLE001 - cleanup must still run
             primary_error = error
             primary_traceback = error.__traceback__
-            traceback_module.clear_frames(primary_traceback)
 
         def read_existing_summary() -> None:
             nonlocal summary
             if summary is None:
-                summary = summary_reader(paths.step_dir, context.rank)
+                try:
+                    candidate = summary_reader(paths.step_dir, context.rank)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    return
+                if _summary_matches_current_context(
+                    candidate,
+                    run_id=args.run_id,
+                    step=args.step,
+                    rank=context.rank,
+                    source_identity=source_identity,
+                ):
+                    summary = candidate
 
         def lifecycle_detail(
             stage: str, lifecycle_error: BaseException
@@ -278,6 +396,8 @@ def _run_synth(
             cleanup_errors.append(("synchronization", error))
 
         def release_owned_model() -> None:
+            if primary_error is not None:
+                _clear_completed_exception_graph_frames(primary_error)
             model_holder.clear()
             cuda_releaser()
 
