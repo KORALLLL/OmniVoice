@@ -60,6 +60,12 @@ eval = [
     "unidecode",            # Unicode normalization
 ]
 
+validation = [
+    "onnx-asr==0.12.0",
+    "onnxruntime-gpu>=1.23,<2",
+    "wandb>=0.22,<1",
+]
+
 [project.scripts]
 omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
