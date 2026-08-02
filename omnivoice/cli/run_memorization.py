@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 from dataclasses import asdict
 from pathlib import Path
 
@@ -10,8 +11,8 @@ from omnivoice.validation.memorization import run_memorization
 
 def _positive_seconds(value: str) -> float:
     seconds = float(value)
-    if seconds <= 0:
-        raise argparse.ArgumentTypeError("must be positive")
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
     return seconds
 
 

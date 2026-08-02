@@ -1,3 +1,4 @@
+import argparse
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ from omnivoice.cli.eval_memorization import (
     check_memorization_patience,
     mean_eval_loss,
 )
+from omnivoice.cli.run_memorization import _positive_seconds
 
 
 class FakeModel(nn.Module):
@@ -70,3 +72,9 @@ def test_mean_eval_loss_is_weighted_by_batch_count():
 def test_mean_eval_loss_rejects_empty_dev_data():
     with pytest.raises(ValueError, match="dev data is empty"):
         mean_eval_loss(FakeModel(), [], device="cpu", dtype=torch.float32)
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1"])
+def test_memorization_cli_rejects_nonfinite_or_nonpositive_durations(value):
+    with pytest.raises(argparse.ArgumentTypeError, match="finite and positive"):
+        _positive_seconds(value)
