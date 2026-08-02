@@ -9,6 +9,7 @@ import os
 import signal
 import threading
 import time
+import traceback as traceback_module
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any
 from omnivoice.validation.artifacts import ValidationPaths
 from omnivoice.validation.synthesis import (
     LifecycleError,
+    SynthesisSummary,
     initialize_distributed,
     load_assignment_manifest,
     load_validation_tts,
@@ -135,21 +137,28 @@ def _run_synth(
     model_holder: list[Any] = [None]
     synchronized = False
     summary = None
+    assignments = None
+    source_identity = None
     with _SigtermFlag() as stop_requested:
         primary_error: BaseException | None = None
         primary_traceback: TracebackType | None = None
+        primary_stage = "assignments"
         cleanup_errors: list[tuple[str, BaseException]] = []
         try:
             assignments = assignment_loader(args.assignments)
+            primary_stage = "source"
             source_identity = source_resolver(
                 model_name=args.model,
                 adapter_checkpoint=args.adapter_checkpoint,
             )
+            primary_stage = "model_load"
             model_holder[0] = model_loader(
                 source_identity=source_identity,
                 context=context,
             )
+            primary_stage = "distributed_initialization"
             distributed_initializer(context)
+            primary_stage = "synthesis"
             summary = synthesizer(
                 assignments=assignments,
                 model=model_holder[0],
@@ -163,28 +172,84 @@ def _run_synth(
         except BaseException as error:  # noqa: BLE001 - cleanup must still run
             primary_error = error
             primary_traceback = error.__traceback__
-
-        cleanup_deadline = monotonic() + cleanup_timeout_seconds
+            traceback_module.clear_frames(primary_traceback)
 
         def read_existing_summary() -> None:
             nonlocal summary
             if summary is None:
                 summary = summary_reader(paths.step_dir, context.rank)
 
+        def lifecycle_detail(
+            stage: str, lifecycle_error: BaseException
+        ) -> LifecycleError:
+            return LifecycleError(
+                stage=stage,
+                type=type(lifecycle_error).__name__,
+                message=str(lifecycle_error),
+            )
+
+        if primary_error is not None and source_identity is not None:
+            primary_detail = lifecycle_detail(primary_stage, primary_error)
+            try:
+                read_existing_summary()
+            except BaseException as error:  # noqa: BLE001 - preserve primary failure
+                cleanup_errors.append(("summary", error))
+            if summary is None:
+                expected = None
+                try:
+                    assignment_count = len(assignments)
+                except (TypeError, AttributeError):
+                    pass
+                else:
+                    expected = len(
+                        range(context.rank, assignment_count, context.world_size)
+                    )
+                summary = SynthesisSummary(
+                    rank=context.rank,
+                    expected=expected,
+                    completed=None,
+                    generated=None,
+                    skipped=None,
+                    failed=None,
+                    complete=False,
+                    stop_reason="error",
+                    source_identity=source_identity,
+                    error=primary_detail,
+                    run_id=args.run_id,
+                    step=args.step,
+                    primary_error=primary_detail,
+                )
+            else:
+                summary = replace(
+                    summary,
+                    complete=False,
+                    stop_reason="error",
+                    error=primary_detail,
+                    run_id=args.run_id,
+                    step=args.step,
+                    primary_error=primary_detail,
+                )
+            try:
+                summary_writer(paths.step_dir, summary)
+            except BaseException as error:  # noqa: BLE001 - preserve primary failure
+                cleanup_errors.append(("summary", error))
+
+        cleanup_deadline = monotonic() + cleanup_timeout_seconds
+
         def correct_summary(stage: str, lifecycle_error: BaseException) -> None:
             nonlocal summary
             read_existing_summary()
             if summary is None:
                 return
+            detail = lifecycle_detail(stage, lifecycle_error)
             summary = replace(
                 summary,
                 complete=False,
                 stop_reason=stage,
-                error=LifecycleError(
-                    stage=stage,
-                    type=type(lifecycle_error).__name__,
-                    message=str(lifecycle_error),
-                ),
+                error=detail,
+                run_id=summary.run_id or args.run_id,
+                step=summary.step if summary.step is not None else args.step,
+                cleanup_error=detail,
             )
             summary_writer(paths.step_dir, summary)
 
@@ -241,18 +306,9 @@ def _run_synth(
         )
         if summary is not None and lifecycle_failure is not None:
             stage, lifecycle_error = lifecycle_failure
-            summary = replace(
-                summary,
-                complete=False,
-                stop_reason=stage,
-                error=LifecycleError(
-                    stage=stage,
-                    type=type(lifecycle_error).__name__,
-                    message=str(lifecycle_error),
-                ),
-            )
             try:
-                summary_writer(paths.step_dir, summary)
+                if cleanup_errors:
+                    correct_summary(stage, lifecycle_error)
             except BaseException as error:  # noqa: BLE001 - preserve primary failure
                 cleanup_errors.append(("summary", error))
 

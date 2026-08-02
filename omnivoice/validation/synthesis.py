@@ -123,15 +123,19 @@ class LifecycleError:
 @dataclass(frozen=True)
 class SynthesisSummary:
     rank: int
-    expected: int
-    completed: int
-    generated: int
-    skipped: int
-    failed: int
+    expected: int | None
+    completed: int | None
+    generated: int | None
+    skipped: int | None
+    failed: int | None
     complete: bool
     stop_reason: str | None
     source_identity: ModelSourceIdentity
     error: LifecycleError | None = None
+    run_id: str | None = None
+    step: int | None = None
+    primary_error: LifecycleError | None = None
+    cleanup_error: LifecycleError | None = None
 
 
 def run_bounded(
@@ -677,11 +681,14 @@ def read_synthesis_summary(
         source = dict(source)
         source["base_source"] = ModelSourceIdentity(**nested_base)
     values["source_identity"] = ModelSourceIdentity(**source)
-    error = values.get("error")
-    if error is not None:
-        if not isinstance(error, dict):
-            raise ValueError("synthesis summary error must be an object or null")
-        values["error"] = LifecycleError(**error)
+    for field_name in ("error", "primary_error", "cleanup_error"):
+        error = values.get(field_name)
+        if error is not None:
+            if not isinstance(error, dict):
+                raise ValueError(
+                    f"synthesis summary {field_name} must be an object or null"
+                )
+            values[field_name] = LifecycleError(**error)
     return SynthesisSummary(**values)
 
 

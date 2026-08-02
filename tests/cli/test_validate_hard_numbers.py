@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +22,7 @@ from omnivoice.validation.synthesis import (
     DistributedContext,
     ModelSourceIdentity,
     SynthesisSummary,
+    read_synthesis_summary,
     write_synthesis_summary,
 )
 
@@ -594,7 +596,16 @@ def test_blocking_lifecycle_cleanup_is_bounded_and_corrects_summary(
     assert payloads[0]["complete"] is False
 
 
-@pytest.mark.parametrize("stage", ["synchronization", "destructor", "cleanup"])
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "synchronization",
+        "destructor",
+        "cleanup",
+        "error_destructor",
+        "error_sync",
+    ],
+)
 def test_real_rank_process_hard_exits_with_no_abandoned_worker_progress(
     tmp_path: Path, stage: str
 ) -> None:
@@ -643,6 +654,12 @@ class BlockingDestructor:
     def __del__(self):
         block()
 
+def synthesize(**kwargs):
+    if stage.startswith("error_"):
+        assert kwargs["model"] is not None
+        raise ValueError("primary synthesis exploded")
+    return summary
+
 args = SimpleNamespace(
     assignments=root / "assignments.jsonl",
     output_root=root,
@@ -660,10 +677,14 @@ _run_synth(
     source_resolver=lambda **kwargs: source_identity,
     distributed_initializer=lambda context: None,
     model_loader=lambda **kwargs: (
-        BlockingDestructor() if stage == "destructor" else object()
+        BlockingDestructor()
+        if stage in {"destructor", "error_destructor"}
+        else object()
     ),
-    synthesizer=lambda **kwargs: summary,
-    synchronizer=block if stage == "synchronization" else lambda: True,
+    synthesizer=synthesize,
+    synchronizer=(
+        block if stage in {"synchronization", "error_sync"} else lambda: True
+    ),
     cuda_releaser=block if stage == "cleanup" else lambda: None,
     cleanup_timeout_seconds=0.05,
 )
@@ -701,8 +722,16 @@ _run_synth(
     assert len(payloads) == 1
     assert payloads[0]["complete"] is False
     assert payloads[0]["stop_reason"] == (
-        "synchronization" if stage == "synchronization" else "cleanup"
+        "synchronization" if stage in {"synchronization", "error_sync"} else "cleanup"
     )
+    if stage.startswith("error_"):
+        assert payloads[0]["primary_error"] == {
+            "stage": "synthesis",
+            "type": "ValueError",
+            "message": "primary synthesis exploded",
+        }
+        assert payloads[0]["cleanup_error"]["type"] == "TimeoutError"
+        assert payloads[0]["completed"] is None
     durable = json.loads(
         (
             tmp_path / "run" / "step-0" / "rank-manifests" / "rank-0.summary.json"
@@ -837,3 +866,142 @@ def test_primary_error_still_corrects_summary_written_before_raise(
         "sync also exploded" in note
         for note in getattr(exc_info.value, "__notes__", [])
     )
+
+
+def test_primary_traceback_releases_model_inside_bounded_cleanup(
+    tmp_path: Path,
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run",
+        step=7,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source_identity = _source_identity(tmp_path)
+    destroyed = threading.Event()
+    destroyed_when_released: list[bool] = []
+
+    class TrackedModel:
+        def __del__(self):
+            destroyed.set()
+
+    def synthesize_with_kwargs(**kwargs):
+        assert isinstance(kwargs["model"], TrackedModel)
+        raise ValueError("primary retains kwargs")
+
+    def release() -> None:
+        destroyed_when_released.append(destroyed.is_set())
+
+    with pytest.raises(ValueError, match="primary retains kwargs") as exc_info:
+        _run_synth(
+            args,
+            assignment_loader=lambda path: [],
+            context_resolver=lambda: DistributedContext(0, 0, 8),
+            source_resolver=lambda **kwargs: source_identity,
+            distributed_initializer=lambda context: None,
+            model_loader=lambda **kwargs: TrackedModel(),
+            synthesizer=synthesize_with_kwargs,
+            synchronizer=lambda: (_ for _ in ()).throw(
+                RuntimeError("secondary synchronization failure")
+            ),
+            cuda_releaser=release,
+        )
+
+    assert destroyed_when_released == [True]
+    traceback_names: list[str] = []
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        traceback_names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    assert "synthesize_with_kwargs" in traceback_names
+    assert any(
+        "secondary synchronization failure" in note
+        for note in getattr(exc_info.value, "__notes__", [])
+    )
+
+
+def test_primary_without_summary_is_published_before_sync_timeout(
+    tmp_path: Path,
+) -> None:
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run-failure",
+        step=13,
+        model="base",
+        adapter_checkpoint=None,
+        deadline_monotonic=None,
+    )
+    source_identity = _source_identity(tmp_path)
+    release = threading.Event()
+    emitted: list[str] = []
+
+    class HardExit(BaseException):
+        def __init__(self, code: int) -> None:
+            self.code = code
+
+    def hard_exit(code: int) -> None:
+        raise HardExit(code)
+
+    def block() -> bool:
+        release.wait()
+        return True
+
+    try:
+        with pytest.raises(HardExit) as exc_info:
+            _run_synth(
+                args,
+                assignment_loader=lambda path: [],
+                context_resolver=lambda: DistributedContext(0, 0, 8),
+                source_resolver=lambda **kwargs: source_identity,
+                distributed_initializer=lambda context: None,
+                model_loader=lambda **kwargs: object(),
+                synthesizer=lambda **kwargs: (_ for _ in ()).throw(
+                    ValueError("primary synthesis exploded")
+                ),
+                synchronizer=block,
+                cuda_releaser=lambda: (_ for _ in ()).throw(
+                    AssertionError("release must not start after sync timeout")
+                ),
+                cleanup_timeout_seconds=0.02,
+                hard_exit=hard_exit,
+                output=emitted.append,
+            )
+        assert exc_info.value.code == INCOMPLETE_EXIT_CODE
+    finally:
+        release.set()
+
+    assert len(emitted) == 1
+    payload = json.loads(emitted[0])
+    assert payload["complete"] is False
+    assert payload["run_id"] == "run-failure"
+    assert payload["rank"] == 0
+    assert payload["step"] == 13
+    assert payload["source_identity"] == asdict(source_identity)
+    assert payload["expected"] == 0
+    assert payload["completed"] is None
+    assert payload["stop_reason"] == "synchronization"
+    assert payload["primary_error"] == {
+        "stage": "synthesis",
+        "type": "ValueError",
+        "message": "primary synthesis exploded",
+    }
+    assert payload["cleanup_error"]["stage"] == "synchronization"
+    assert payload["cleanup_error"]["type"] == "TimeoutError"
+    durable = json.loads(
+        (
+            tmp_path
+            / "run-failure"
+            / "step-13"
+            / "rank-manifests"
+            / "rank-0.summary.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert durable == {
+        key: value for key, value in payload.items() if key not in {"synchronized"}
+    }
+    restored = read_synthesis_summary(tmp_path / "run-failure" / "step-13", rank=0)
+    assert asdict(restored) == durable
