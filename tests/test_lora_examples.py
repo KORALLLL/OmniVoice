@@ -64,6 +64,7 @@ def test_lora_example_launcher_resolves_config_from_supported_workdirs(
     commands = [shlex.split(line) for line in command_log.read_text().splitlines()]
     assert commands[-1] == [
         "launch",
+        "--multi_gpu",
         "--gpu_ids",
         "0,1,2,3,4,5,6,7",
         "--num_processes",

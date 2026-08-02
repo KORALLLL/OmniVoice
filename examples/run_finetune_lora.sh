@@ -75,6 +75,7 @@ if [ "${stage}" -le "1" ] && [ "${stop_stage}" -ge "1" ]; then
     echo "Stage 1: Fine-tuning LoRA adapters"
 
     accelerate launch \
+        --multi_gpu \
         --gpu_ids "${GPU_IDS}" \
         --num_processes "${NUM_GPUS}" \
         -m omnivoice.cli.train \

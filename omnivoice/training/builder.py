@@ -51,6 +51,7 @@ from omnivoice.training.config import TrainingConfig
 from omnivoice.training.lora import (
     apply_lora,
     load_lora_adapter,
+    resize_lora_token_embeddings,
     trainable_parameter_counts,
 )
 
@@ -64,9 +65,7 @@ def _finalize_training_model(model, tokenizer, config):
     if len(tokenizer) != llm_config.vocab_size:
         resize_model = getattr(model, "llm", model)
         if config.lora_enabled:
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(config.seed)
-                resize_model.resize_token_embeddings(len(tokenizer))
+            resize_lora_token_embeddings(model, len(tokenizer), config.seed)
         else:
             resize_model.resize_token_embeddings(len(tokenizer))
         llm_config.vocab_size = len(tokenizer)

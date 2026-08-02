@@ -6,8 +6,10 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import torch
 from accelerate.utils import DistributedType, broadcast_object_list
 from peft import LoraConfig, PeftModel, get_peft_model
+from transformers import AutoTokenizer
 
 DEFAULT_LORA_TARGET_MODULES = (
     "q_proj",
@@ -84,6 +86,30 @@ def trainable_parameter_counts(model):
     return trainable, total
 
 
+def text_embedding_vocab_size(model):
+    """Return the unwrapped text embedding vocabulary size."""
+    if isinstance(model, PeftModel):
+        model = model.get_base_model()
+    embeddings = model.get_input_embeddings()
+    embeddings = getattr(embeddings, "base_layer", embeddings)
+    return int(embeddings.weight.shape[0])
+
+
+def resize_lora_token_embeddings(model, vocab_size, seed):
+    """Resize text embeddings deterministically before attaching LoRA."""
+    current_vocab_size = text_embedding_vocab_size(model)
+    llm_config = getattr(model.config, "llm_config", model.config)
+    if current_vocab_size == vocab_size:
+        llm_config.vocab_size = vocab_size
+        return
+
+    resize_model = getattr(model, "llm", model)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        resize_model.resize_token_embeddings(vocab_size)
+    llm_config.vocab_size = vocab_size
+
+
 def apply_lora(model, config):
     """Insert LoRA adapters after validating every requested target module."""
     validate_lora_config(config)
@@ -116,7 +142,10 @@ def resolve_adapter_dir(checkpoint_path):
 
 def read_lora_metadata(checkpoint_path):
     """Read and validate schema-v1 metadata from a checkpoint root."""
-    metadata_path = Path(checkpoint_path) / "adapter_metadata.json"
+    checkpoint_path = Path(checkpoint_path)
+    if (checkpoint_path / "adapter_config.json").is_file():
+        checkpoint_path = checkpoint_path.parent
+    metadata_path = checkpoint_path / "adapter_metadata.json"
     with metadata_path.open() as metadata_file:
         metadata = json.load(metadata_file)
     if metadata.get("format_version") != LORA_METADATA_FORMAT_VERSION:
@@ -172,6 +201,8 @@ def _lora_metadata(model, config, step):
         "format_version": LORA_METADATA_FORMAT_VERSION,
         "base_model_name_or_path": configured_base,
         "step": step,
+        "text_vocab_size": text_embedding_vocab_size(model),
+        "embedding_resize_seed": config.seed,
         **live_values,
         "lora_target_modules": configured_targets,
     }
@@ -343,9 +374,110 @@ def load_lora_adapter(model, checkpoint_path, config=None, is_trainable=False):
     )
 
 
+def _load_checkpoint_text_tokenizer(checkpoint_root):
+    tokenizer_files = (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "tokenizer.model",
+        "spiece.model",
+        "vocab.json",
+        "vocab.txt",
+    )
+    if not any((checkpoint_root / name).is_file() for name in tokenizer_files):
+        return None
+    try:
+        return AutoTokenizer.from_pretrained(checkpoint_root, local_files_only=True)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"Could not load the LoRA checkpoint text tokenizer from {checkpoint_root}"
+        ) from exc
+
+
+def _legacy_resize_seed(checkpoint_root):
+    train_config_path = checkpoint_root / "train_config.json"
+    if not train_config_path.is_file():
+        return None
+    try:
+        with train_config_path.open() as config_file:
+            train_config = json.load(config_file)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"Could not read legacy LoRA resize metadata from {train_config_path}"
+        ) from exc
+    return train_config.get("seed")
+
+
+def _prepare_lora_base_for_inference(model, checkpoint_path):
+    checkpoint_root, _ = resolve_adapter_dir(checkpoint_path)
+    metadata = read_lora_metadata(checkpoint_root)
+    checkpoint_tokenizer = _load_checkpoint_text_tokenizer(checkpoint_root)
+    metadata_vocab_size = metadata.get("text_vocab_size")
+    if metadata_vocab_size is not None and (
+        isinstance(metadata_vocab_size, bool)
+        or not isinstance(metadata_vocab_size, int)
+        or metadata_vocab_size <= 0
+    ):
+        raise ValueError(
+            "LoRA checkpoint text_vocab_size must be a positive integer"
+        )
+
+    if checkpoint_tokenizer is not None:
+        tokenizer_vocab_size = len(checkpoint_tokenizer)
+        if (
+            metadata_vocab_size is not None
+            and tokenizer_vocab_size != metadata_vocab_size
+        ):
+            raise ValueError(
+                "LoRA checkpoint tokenizer vocabulary differs from metadata: "
+                f"tokenizer={tokenizer_vocab_size}, "
+                f"text_vocab_size={metadata_vocab_size}"
+            )
+        target_vocab_size = tokenizer_vocab_size
+    else:
+        target_vocab_size = metadata_vocab_size
+
+    current_vocab_size = text_embedding_vocab_size(model)
+    if target_vocab_size is not None and target_vocab_size != current_vocab_size:
+        if checkpoint_tokenizer is None:
+            raise ValueError(
+                "LoRA checkpoint text vocabulary differs from the base model, but "
+                "the checkpoint tokenizer is missing; load the complete checkpoint "
+                "root or re-save the adapter with tokenizer artifacts"
+            )
+        resize_seed = metadata.get("embedding_resize_seed")
+        if resize_seed is None:
+            resize_seed = _legacy_resize_seed(checkpoint_root)
+        if isinstance(resize_seed, bool) or not isinstance(resize_seed, int):
+            raise ValueError(
+                "LoRA checkpoint requires an embedding resize seed; expected "
+                "adapter_metadata.json field 'embedding_resize_seed' or a legacy "
+                "train_config.json integer 'seed'"
+            )
+        resize_lora_token_embeddings(model, target_vocab_size, resize_seed)
+
+    if checkpoint_tokenizer is not None:
+        model.text_tokenizer = checkpoint_tokenizer
+        model.config.pad_token_id = checkpoint_tokenizer.pad_token_id
+        model.config.bos_token_id = checkpoint_tokenizer.bos_token_id
+        model.config.eos_token_id = checkpoint_tokenizer.eos_token_id
+    return model
+
+
 def load_lora_for_inference(model, checkpoint_path):
     """Load a checkpoint adapter as a frozen model ready for inference."""
-    model = load_lora_adapter(model, checkpoint_path, is_trainable=False)
+    model = _prepare_lora_base_for_inference(model, checkpoint_path)
+    try:
+        model = load_lora_adapter(model, checkpoint_path, is_trainable=False)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "lora_embedding_A" in message and "size mismatch" in message:
+            raise ValueError(
+                "LoRA adapter embedding vocabulary differs from the base model and "
+                "this legacy checkpoint lacks enough tokenizer/resize metadata to "
+                "reconstruct it; load the complete checkpoint root or re-save the "
+                "adapter"
+            ) from exc
+        raise
     model.requires_grad_(False)
     model.eval()
     return model

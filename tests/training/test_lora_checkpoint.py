@@ -74,6 +74,8 @@ def test_lora_checkpoint_omits_frozen_model_and_contains_adapter(
         "format_version": 1,
         "base_model_name_or_path": "k2-fsa/OmniVoice",
         "step": 7,
+        "text_vocab_size": 32,
+        "embedding_resize_seed": 42,
         "lora_rank": 32,
         "lora_alpha": 64,
         "lora_dropout": 0.05,
