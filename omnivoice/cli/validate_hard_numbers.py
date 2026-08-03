@@ -730,6 +730,18 @@ def _run_score(
         require_exact_coverage(
             expected_ids, [record.get("id") for record in synthesis_records]
         )
+        hash_valid_synthesis_ids = valid_completed_ids(
+            synthesis_records, required_files=("wav",)
+        )
+        require_exact_coverage(
+            expected_ids,
+            [
+                record["id"]
+                for record in synthesis_records
+                if record.get("id") in hash_valid_synthesis_ids
+                and _valid_synthesis_wav(record)
+            ],
+        )
         require_exact_coverage(
             expected_ids, [record.get("id") for record in hypothesis_records]
         )

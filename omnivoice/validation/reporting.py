@@ -12,7 +12,11 @@ from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
-from omnivoice.validation.artifacts import ValidationPaths, require_exact_coverage
+from omnivoice.validation.artifacts import (
+    ValidationPaths,
+    require_exact_coverage,
+    valid_completed_ids,
+)
 from omnivoice.validation.hard_numbers import HARD_NUMBER_COUNT
 from omnivoice.validation.metrics import (
     AggregateBlock,
@@ -182,6 +186,11 @@ def score_validation_run(
     )
     synthesis_ids = [_identifier(record, "synthesis record") for record in synthesis]
     require_exact_coverage(assignment_ids, synthesis_ids)
+    if synthesis_records is not None:
+        require_exact_coverage(
+            assignment_ids,
+            valid_completed_ids(synthesis, required_files=("wav",)),
+        )
     aggregates = aggregate_scores(scores)
     synth_seconds = _finite_nonnegative(synthesis_seconds, "synthesis_seconds")
     transcription_seconds = _finite_nonnegative(asr_seconds, "asr_seconds")

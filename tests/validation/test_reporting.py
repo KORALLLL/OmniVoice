@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import soundfile as sf
 
 from omnivoice.validation.artifacts import CoverageError, ValidationPaths
 from omnivoice.validation.reporting import (
@@ -68,11 +70,41 @@ def test_score_validation_run_rejects_incomplete_hypothesis_coverage() -> None:
         score_validation_run(assignments, hypotheses[:-1])
 
 
+def test_score_validation_run_rejects_error_bearing_synthesis_records(
+    tmp_path: Path,
+) -> None:
+    """Catches the public scoring API certifying failed synthesis rows by ID."""
+    assignments, hypotheses = _complete_inputs()
+    wav_path = tmp_path / "valid.wav"
+    sf.write(wav_path, [0.25], 24_000, subtype="PCM_16")
+    digest = hashlib.sha256(wav_path.read_bytes()).hexdigest()
+    synthesis = [
+        {"id": item.id, "sha256": digest, "wav": str(wav_path)}
+        for item in assignments
+    ]
+    synthesis[-1]["error"] = "synthesis failed"
+
+    with pytest.raises(CoverageError, match="utt-1999"):
+        score_validation_run(
+            assignments,
+            hypotheses,
+            synthesis_records=synthesis,
+        )
+
+
 def test_write_validation_report_persists_complete_stable_artifacts(tmp_path: Path) -> None:
     """Catches reports that omit raw counts, merged rows, or timing metadata."""
     assignments, hypotheses = _complete_inputs()
+    wav_path = tmp_path / "valid.wav"
+    sf.write(wav_path, [0.25], 24_000, subtype="PCM_16")
+    digest = hashlib.sha256(wav_path.read_bytes()).hexdigest()
     synthesis = [
-        {"id": item.id, "rank": index % 8, "wav": f"/audio/{item.id}.wav"}
+        {
+            "id": item.id,
+            "rank": index % 8,
+            "sha256": digest,
+            "wav": str(wav_path),
+        }
         for index, item in enumerate(reversed(assignments))
     ]
     result = score_validation_run(

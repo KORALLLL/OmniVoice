@@ -38,7 +38,14 @@ from omnivoice.validation.synthesis import (
 _EXCEPTION_GROUP = builtins.ExceptionGroup
 
 
-def _score_inputs() -> tuple[list[SimpleNamespace], list[dict[str, object]], list[dict[str, object]]]:
+def _score_inputs(
+    tmp_path: Path,
+) -> tuple[
+    list[SimpleNamespace], list[dict[str, object]], list[dict[str, object]]
+]:
+    wav_path = tmp_path / "valid-score.wav"
+    sf.write(wav_path, np.array([0.25], dtype=np.float32), 24_000, subtype="PCM_16")
+    digest = hashlib.sha256(wav_path.read_bytes()).hexdigest()
     assignments = [
         SimpleNamespace(
             id=f"utt-{index:04d}",
@@ -52,9 +59,10 @@ def _score_inputs() -> tuple[list[SimpleNamespace], list[dict[str, object]], lis
         {
             "id": assignment.id,
             "rank": index % 8,
+            "sha256": digest,
             "text": assignment.text,
             "voice_id": f"voice-{index % 20:02d}",
-            "wav": f"/audio/{assignment.id}.wav",
+            "wav": str(wav_path),
         }
         for index, assignment in enumerate(assignments)
     ]
@@ -83,7 +91,7 @@ def test_score_parser_accepts_reporting_metadata(tmp_path: Path) -> None:
 
 def test_run_score_writes_local_artifacts_before_wandb_failure(tmp_path: Path) -> None:
     """Catches W&B initialization happening before complete local reporting."""
-    assignments, synthesis, hypotheses = _score_inputs()
+    assignments, synthesis, hypotheses = _score_inputs(tmp_path)
     args = SimpleNamespace(
         assignments=tmp_path / "assignments.jsonl", output_root=tmp_path,
         run_id="run-1", step=625, steps_per_epoch=5_000, dev_loss=0.25,
@@ -121,7 +129,7 @@ def test_run_score_writes_local_artifacts_before_wandb_failure(tmp_path: Path) -
 
 def test_run_score_never_initializes_wandb_for_incomplete_rank_coverage(tmp_path: Path) -> None:
     """Catches an incomplete rank merge reaching W&B or producing metrics."""
-    assignments, synthesis, hypotheses = _score_inputs()
+    assignments, synthesis, hypotheses = _score_inputs(tmp_path)
     args = SimpleNamespace(
         assignments=tmp_path / "assignments.jsonl", output_root=tmp_path,
         run_id="run-1", step=625, steps_per_epoch=5_000, dev_loss=None,
@@ -140,6 +148,56 @@ def test_run_score_never_initializes_wandb_for_incomplete_rank_coverage(tmp_path
     assert code == INCOMPLETE_EXIT_CODE
     assert stores == []
     assert not ValidationPaths(tmp_path, "run-1", 625).metrics.exists()
+
+
+@pytest.mark.parametrize("invalid_kind", ["error", "nonconforming_wav"])
+def test_run_score_rejects_unsuccessful_synthesis_before_local_or_wandb_output(
+    tmp_path: Path, invalid_kind: str
+) -> None:
+    """Catches ID-only synthesis coverage when hypotheses are already complete."""
+    assignments, synthesis, hypotheses = _score_inputs(tmp_path)
+    if invalid_kind == "error":
+        synthesis[-1]["error"] = "synthesis failed"
+    else:
+        invalid_wav = tmp_path / "hash-valid-but-not-wav.wav"
+        invalid_wav.write_bytes(b"not a WAV")
+        synthesis[-1]["wav"] = str(invalid_wav)
+        synthesis[-1]["sha256"] = hashlib.sha256(invalid_wav.read_bytes()).hexdigest()
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run-1",
+        step=625,
+        steps_per_epoch=5_000,
+        dev_loss=None,
+        synthesis_seconds=100.0,
+        asr_seconds=50.0,
+        wall_time_seconds=160.0,
+    )
+    store_calls: list[Path] = []
+
+    code = _run_score(
+        args,
+        assignment_loader=lambda path: assignments,
+        synthesis_merger=lambda paths: synthesis,
+        hypothesis_merger=lambda paths: hypotheses,
+        run_store_factory=lambda path: store_calls.append(path),
+    )
+
+    paths = ValidationPaths(tmp_path, "run-1", 625)
+    assert code == INCOMPLETE_EXIT_CODE
+    assert store_calls == []
+    assert not any(
+        path.exists()
+        for path in (
+            paths.manifest,
+            paths.hypotheses,
+            paths.per_utt,
+            paths.metrics,
+            paths.report,
+            paths.run_metadata,
+        )
+    )
 
 
 def _valid_asr_stage_inputs(
