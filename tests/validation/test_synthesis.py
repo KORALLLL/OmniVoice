@@ -518,7 +518,10 @@ def test_deadline_and_stop_request_leave_durable_partial_summary(
     assert deadline_model.generate_calls == []
 
     stop_model = FakeModel()
-    stop_requested = lambda: len(stop_model.generate_calls) == 1
+
+    def stop_requested() -> bool:
+        return len(stop_model.generate_calls) == 1
+
     stopped = synthesize_rank(
         assignments=assignments,
         model=stop_model,

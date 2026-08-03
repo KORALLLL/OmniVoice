@@ -66,6 +66,12 @@ validation = [
     "wandb>=0.22,<1",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=9,<10",
+    "ruff>=0.16,<0.17",
+]
+
 [project.scripts]
 omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
@@ -102,6 +108,7 @@ constraint-dependencies = [
 ]
 
 [tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
 ignore = ["F401", "E402", "F403", "F841", "E741"]
 
 [tool.hatch.build.targets.sdist]
