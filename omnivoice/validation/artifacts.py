@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import soundfile as sf
+
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -166,6 +168,24 @@ def valid_completed_ids(
         elif isinstance(record.get("hypothesis"), str):
             completed.add(identifier)
     return completed
+
+
+def valid_synthesis_wav(record: Mapping[str, Any]) -> bool:
+    """Return whether a synthesis record points to nonempty mono 24 kHz PCM16 WAV."""
+    raw_path = record.get("wav")
+    if not isinstance(raw_path, str) or not raw_path:
+        return False
+    try:
+        info = sf.info(raw_path)
+    except (OSError, RuntimeError):
+        return False
+    return (
+        info.format == "WAV"
+        and info.subtype == "PCM_16"
+        and info.samplerate == 24_000
+        and info.channels == 1
+        and info.frames > 0
+    )
 
 
 class AtomicJsonlLedger:

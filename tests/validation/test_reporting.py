@@ -92,6 +92,31 @@ def test_score_validation_run_rejects_error_bearing_synthesis_records(
         )
 
 
+def test_score_validation_run_rejects_hash_valid_non_wav_synthesis(
+    tmp_path: Path,
+) -> None:
+    """Catches the public scoring API accepting a hash-valid non-WAV by ID."""
+    assignments, hypotheses = _complete_inputs()
+    wav_path = tmp_path / "valid.wav"
+    sf.write(wav_path, [0.25], 24_000, subtype="PCM_16")
+    valid_digest = hashlib.sha256(wav_path.read_bytes()).hexdigest()
+    synthesis = [
+        {"id": item.id, "sha256": valid_digest, "wav": str(wav_path)}
+        for item in assignments
+    ]
+    invalid_wav = tmp_path / "hash-valid-but-not-wav.wav"
+    invalid_wav.write_bytes(b"not a WAV")
+    synthesis[-1]["wav"] = str(invalid_wav)
+    synthesis[-1]["sha256"] = hashlib.sha256(invalid_wav.read_bytes()).hexdigest()
+
+    with pytest.raises(CoverageError, match="utt-1999"):
+        score_validation_run(
+            assignments,
+            hypotheses,
+            synthesis_records=synthesis,
+        )
+
+
 def test_write_validation_report_persists_complete_stable_artifacts(tmp_path: Path) -> None:
     """Catches reports that omit raw counts, merged rows, or timing metadata."""
     assignments, hypotheses = _complete_inputs()

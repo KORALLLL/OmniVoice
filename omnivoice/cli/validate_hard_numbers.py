@@ -18,13 +18,12 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any
 
-import soundfile as sf
-
 from omnivoice.validation.artifacts import (
     ValidationPaths,
     merge_rank_ledgers,
     require_exact_coverage,
     valid_completed_ids,
+    valid_synthesis_wav,
 )
 from omnivoice.validation.asr import (
     AsrSummary,
@@ -311,7 +310,7 @@ def _run_asr(
                     record["id"]
                     for record in synthesis_records
                     if record.get("id") in hash_valid_ids
-                    and _valid_synthesis_wav(record)
+                    and valid_synthesis_wav(record)
                 ],
             )
         except (OSError, TypeError, ValueError):
@@ -421,24 +420,6 @@ def _incomplete_asr_summary(rank: int, stop_reason: str) -> AsrSummary:
         failed=0,
         complete=False,
         stop_reason=stop_reason,
-    )
-
-
-def _valid_synthesis_wav(record: dict[str, Any]) -> bool:
-    """Reject hashed artifacts that are not TTS's mono 24 kHz PCM WAVs."""
-    raw_path = record.get("wav")
-    if not isinstance(raw_path, str) or not raw_path:
-        return False
-    try:
-        info = sf.info(raw_path)
-    except (OSError, RuntimeError):
-        return False
-    return (
-        info.format == "WAV"
-        and info.subtype == "PCM_16"
-        and info.samplerate == 24_000
-        and info.channels == 1
-        and info.frames > 0
     )
 
 
@@ -739,7 +720,7 @@ def _run_score(
                 record["id"]
                 for record in synthesis_records
                 if record.get("id") in hash_valid_synthesis_ids
-                and _valid_synthesis_wav(record)
+                and valid_synthesis_wav(record)
             ],
         )
         require_exact_coverage(

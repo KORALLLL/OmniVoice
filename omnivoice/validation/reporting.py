@@ -16,6 +16,7 @@ from omnivoice.validation.artifacts import (
     ValidationPaths,
     require_exact_coverage,
     valid_completed_ids,
+    valid_synthesis_wav,
 )
 from omnivoice.validation.hard_numbers import HARD_NUMBER_COUNT
 from omnivoice.validation.metrics import (
@@ -187,9 +188,21 @@ def score_validation_run(
     synthesis_ids = [_identifier(record, "synthesis record") for record in synthesis]
     require_exact_coverage(assignment_ids, synthesis_ids)
     if synthesis_records is not None:
+        completed_synthesis_ids = valid_completed_ids(
+            synthesis, required_files=("wav",)
+        )
         require_exact_coverage(
             assignment_ids,
-            valid_completed_ids(synthesis, required_files=("wav",)),
+            completed_synthesis_ids,
+        )
+        require_exact_coverage(
+            assignment_ids,
+            [
+                record["id"]
+                for record in synthesis
+                if record["id"] in completed_synthesis_ids
+                and valid_synthesis_wav(record)
+            ],
         )
     aggregates = aggregate_scores(scores)
     synth_seconds = _finite_nonnegative(synthesis_seconds, "synthesis_seconds")
