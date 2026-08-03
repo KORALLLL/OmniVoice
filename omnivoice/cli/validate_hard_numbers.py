@@ -33,6 +33,7 @@ from omnivoice.validation.asr import (
     transcribe_rank,
 )
 from omnivoice.validation.hard_numbers import HARD_NUMBER_COUNT
+from omnivoice.validation.reporting import score_validation_run, write_validation_report
 from omnivoice.validation.synthesis import (
     LifecycleError,
     SynthesisSummary,
@@ -48,6 +49,7 @@ from omnivoice.validation.synthesis import (
     synthesize_rank,
     write_synthesis_summary,
 )
+from omnivoice.validation.wandb_logging import WandbRunStore, log_validation
 
 INCOMPLETE_EXIT_CODE = 2
 _BASE_EXCEPTION_GROUP = builtins.__dict__.get("BaseExceptionGroup", ())
@@ -167,6 +169,20 @@ def _finite_float(value: str) -> float:
     return number
 
 
+def _nonnegative_float(value: str) -> float:
+    number = _finite_float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return number
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     stages = parser.add_subparsers(dest="stage", required=True)
@@ -185,6 +201,16 @@ def build_parser() -> argparse.ArgumentParser:
     asr.add_argument("--run-id", required=True)
     asr.add_argument("--step", type=int, required=True)
     asr.add_argument("--deadline-monotonic", type=_finite_float)
+    score = stages.add_parser("score", help="score and report one complete validation")
+    score.add_argument("--assignments", type=Path, required=True)
+    score.add_argument("--output-root", type=Path, required=True)
+    score.add_argument("--run-id", required=True)
+    score.add_argument("--step", type=int, required=True)
+    score.add_argument("--steps-per-epoch", type=_positive_int, required=True)
+    score.add_argument("--dev-loss", type=_finite_float)
+    score.add_argument("--synthesis-seconds", type=_nonnegative_float, default=0.0)
+    score.add_argument("--asr-seconds", type=_nonnegative_float, default=0.0)
+    score.add_argument("--wall-time-seconds", type=_nonnegative_float, default=0.0)
     return parser
 
 
@@ -675,12 +701,108 @@ def _run_synth(
         return code
 
 
+def _run_score(
+    args: argparse.Namespace,
+    *,
+    assignment_loader: Callable[[Path], Any] = load_assignment_manifest,
+    synthesis_merger: Callable[[Any], list[dict[str, Any]]] = merge_rank_ledgers,
+    hypothesis_merger: Callable[[Any], list[dict[str, Any]]] = merge_rank_ledgers,
+    run_store_factory: Callable[[Path], Any] = WandbRunStore,
+    output: Callable[[str], None] = _output_json,
+    serializer: Callable[..., str] = json.dumps,
+) -> int:
+    """Write complete local scores before initializing the online W&B run."""
+    paths = ValidationPaths(args.output_root, args.run_id, args.step)
+    try:
+        assignments = assignment_loader(args.assignments)
+        expected_ids = [assignment.id for assignment in assignments]
+        if len(expected_ids) != HARD_NUMBER_COUNT:
+            raise ValueError(
+                f"scoring requires exactly {HARD_NUMBER_COUNT} assignments; "
+                f"got {len(expected_ids)}"
+            )
+        synthesis_records = synthesis_merger(
+            [paths.rank_manifest(rank) for rank in range(8)]
+        )
+        hypothesis_records = hypothesis_merger(
+            [paths.rank_hypotheses(rank) for rank in range(8)]
+        )
+        require_exact_coverage(
+            expected_ids, [record.get("id") for record in synthesis_records]
+        )
+        require_exact_coverage(
+            expected_ids, [record.get("id") for record in hypothesis_records]
+        )
+        result = score_validation_run(
+            assignments,
+            hypothesis_records,
+            synthesis_records=synthesis_records,
+            synthesis_seconds=args.synthesis_seconds,
+            asr_seconds=args.asr_seconds,
+            wall_time_seconds=args.wall_time_seconds,
+        )
+        run_metadata = {
+            "asr_seconds": args.asr_seconds,
+            "dev_loss": args.dev_loss,
+            "run_id": args.run_id,
+            "step": args.step,
+            "steps_per_epoch": args.steps_per_epoch,
+            "synthesis_seconds": args.synthesis_seconds,
+            "wall_time_seconds": args.wall_time_seconds,
+        }
+        write_validation_report(paths, result, run_metadata=run_metadata)
+    except (OSError, TypeError, ValueError) as error:
+        output(
+            serializer(
+                {"complete": False, "error": str(error), "stage": "score"},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return INCOMPLETE_EXIT_CODE
+
+    try:
+        store = run_store_factory(paths.wandb_ids)
+        selected_ids = store.load_or_create_audio_ids(expected_ids[:4])
+        synthesis_by_id = {record["id"]: record for record in synthesis_records}
+        fixed_audio_records = [synthesis_by_id[identifier] for identifier in selected_ids]
+        run = store.init(config=run_metadata)
+        log_validation(
+            run,
+            result,
+            fixed_audio_records,
+            step=args.step,
+            steps_per_epoch=args.steps_per_epoch,
+            dev_loss=args.dev_loss,
+        )
+    except Exception as error:  # noqa: BLE001 - online failure must stop training
+        output(
+            serializer(
+                {"complete": False, "error": str(error), "stage": "wandb"},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 1
+
+    output(
+        serializer(
+            {"complete": True, "coverage": result.coverage, "step": args.step},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.stage == "synth":
         return _run_synth(args)
     if args.stage == "asr":
         return _run_asr(args)
+    if args.stage == "score":
+        return _run_score(args)
     raise AssertionError(f"unsupported validation stage {args.stage!r}")
 
 

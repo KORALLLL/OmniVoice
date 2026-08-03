@@ -1,5 +1,6 @@
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 
 def test_validation_extra_contains_runtime_dependencies():

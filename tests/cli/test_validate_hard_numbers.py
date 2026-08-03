@@ -21,6 +21,7 @@ import omnivoice.cli.validate_hard_numbers as validation_cli
 from omnivoice.cli.validate_hard_numbers import (
     INCOMPLETE_EXIT_CODE,
     _run_asr,
+    _run_score,
     _run_synth,
     build_parser,
 )
@@ -35,6 +36,110 @@ from omnivoice.validation.synthesis import (
 )
 
 _EXCEPTION_GROUP = builtins.ExceptionGroup
+
+
+def _score_inputs() -> tuple[list[SimpleNamespace], list[dict[str, object]], list[dict[str, object]]]:
+    assignments = [
+        SimpleNamespace(
+            id=f"utt-{index:04d}",
+            category="cardinal",
+            text="1",
+            normalized_gold="один",
+        )
+        for index in range(2_000)
+    ]
+    synthesis = [
+        {
+            "id": assignment.id,
+            "rank": index % 8,
+            "text": assignment.text,
+            "voice_id": f"voice-{index % 20:02d}",
+            "wav": f"/audio/{assignment.id}.wav",
+        }
+        for index, assignment in enumerate(assignments)
+    ]
+    hypotheses = [
+        {"id": assignment.id, "rank": index % 8, "hypothesis": "один"}
+        for index, assignment in enumerate(assignments)
+    ]
+    return assignments, synthesis, hypotheses
+
+
+def test_score_parser_accepts_reporting_metadata(tmp_path: Path) -> None:
+    """Catches score metadata options being omitted from the public CLI."""
+    parsed = build_parser().parse_args(
+        [
+            "score", "--assignments", str(tmp_path / "assignments.jsonl"),
+            "--output-root", str(tmp_path), "--run-id", "run-1", "--step", "625",
+            "--steps-per-epoch", "5000", "--dev-loss", "0.25",
+            "--synthesis-seconds", "100", "--asr-seconds", "50", "--wall-time-seconds", "160",
+        ]
+    )
+
+    assert parsed.step == 625
+    assert parsed.steps_per_epoch == 5_000
+    assert parsed.dev_loss == 0.25
+
+
+def test_run_score_writes_local_artifacts_before_wandb_failure(tmp_path: Path) -> None:
+    """Catches W&B initialization happening before complete local reporting."""
+    assignments, synthesis, hypotheses = _score_inputs()
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl", output_root=tmp_path,
+        run_id="run-1", step=625, steps_per_epoch=5_000, dev_loss=0.25,
+        synthesis_seconds=100.0, asr_seconds=50.0, wall_time_seconds=160.0,
+    )
+    paths = ValidationPaths(tmp_path, "run-1", 625)
+
+    class FailingStore:
+        def __init__(self, path: Path) -> None:
+            assert path == paths.wandb_ids
+
+        def load_or_create_audio_ids(self, candidates: list[str]) -> list[str]:
+            assert paths.metrics.exists()
+            assert paths.report.exists()
+            assert paths.run_metadata.exists()
+            return candidates[:4]
+
+        def init(self, config: dict[str, object]):
+            assert paths.manifest.exists()
+            assert paths.hypotheses.exists()
+            assert paths.per_utt.exists()
+            raise RuntimeError("offline")
+
+    code = _run_score(
+        args,
+        assignment_loader=lambda path: assignments,
+        synthesis_merger=lambda paths: synthesis,
+        hypothesis_merger=lambda paths: hypotheses,
+        run_store_factory=FailingStore,
+    )
+
+    assert code == 1
+    assert json.loads(paths.metrics.read_text())["coverage"] == 2_000
+
+
+def test_run_score_never_initializes_wandb_for_incomplete_rank_coverage(tmp_path: Path) -> None:
+    """Catches an incomplete rank merge reaching W&B or producing metrics."""
+    assignments, synthesis, hypotheses = _score_inputs()
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl", output_root=tmp_path,
+        run_id="run-1", step=625, steps_per_epoch=5_000, dev_loss=None,
+        synthesis_seconds=100.0, asr_seconds=50.0, wall_time_seconds=160.0,
+    )
+    stores: list[object] = []
+
+    code = _run_score(
+        args,
+        assignment_loader=lambda path: assignments,
+        synthesis_merger=lambda paths: synthesis[:-1],
+        hypothesis_merger=lambda paths: hypotheses,
+        run_store_factory=lambda path: stores.append(object()),
+    )
+
+    assert code == INCOMPLETE_EXIT_CODE
+    assert stores == []
+    assert not ValidationPaths(tmp_path, "run-1", 625).metrics.exists()
 
 
 def _valid_asr_stage_inputs(
