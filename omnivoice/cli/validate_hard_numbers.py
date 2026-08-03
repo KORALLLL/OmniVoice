@@ -27,6 +27,7 @@ from omnivoice.validation.artifacts import (
     valid_completed_ids,
 )
 from omnivoice.validation.asr import (
+    AsrSummary,
     load_gigaam,
     persist_rank_failure,
     transcribe_rank,
@@ -255,6 +256,10 @@ def _run_asr(
     context = context_resolver()
     paths = ValidationPaths(args.output_root, args.run_id, args.step)
     with _SigtermFlag() as stop_requested:
+        synthesis_records: list[dict[str, Any]] = []
+        expected_ids: list[str] = []
+        stage: str | None = None
+        summary: AsrSummary | None = None
         try:
             assignments = assignment_loader(args.assignments)
             expected_ids = [assignment.id for assignment in assignments]
@@ -282,51 +287,57 @@ def _run_asr(
                     and _valid_synthesis_wav(record)
                 ],
             )
-        except (OSError, TypeError, ValueError) as error:
+        except (OSError, TypeError, ValueError):
+            stage = "synthesis_coverage"
+        else:
+            stop_reason = _asr_stop_reason(args.deadline_monotonic, stop_requested)
+            if stop_reason is not None:
+                stage = stop_reason
+                summary = _incomplete_asr_summary(context.rank, stop_reason)
+            else:
+                model = None
+                try:
+                    model = model_loader(context.local_rank)
+                    stop_reason = _asr_stop_reason(
+                        args.deadline_monotonic, stop_requested
+                    )
+                    if stop_reason is not None:
+                        stage = stop_reason
+                        summary = _incomplete_asr_summary(context.rank, stop_reason)
+                    else:
+                        summary = transcriber(
+                            synthesis_records=synthesis_records,
+                            recognizer=model,
+                            output_dir=paths,
+                            rank=context.rank,
+                            world_size=context.world_size,
+                            deadline_monotonic=args.deadline_monotonic,
+                            stop_requested=stop_requested,
+                        )
+                except Exception as error:  # noqa: BLE001 - durable lifecycle failure contract
+                    summary = failure_persister(
+                        synthesis_records=synthesis_records,
+                        output_dir=paths,
+                        rank=context.rank,
+                        world_size=context.world_size,
+                        error=error,
+                    )
+                finally:
+                    model = None
+                    gc.collect()
+
+        synchronized = synchronizer()
+        if stage == "synthesis_coverage":
             output(
                 serializer(
-                    {"complete": False, "stage": "synthesis_coverage"},
+                    {"complete": False, "stage": stage},
                     ensure_ascii=False,
                     sort_keys=True,
                 )
             )
-            del error
             return INCOMPLETE_EXIT_CODE
-
-        model = None
-        try:
-            if stop_requested():
-                output(
-                    serializer(
-                        {"complete": False, "stage": "signal"},
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    )
-                )
-                return INCOMPLETE_EXIT_CODE
-            model = model_loader(context.local_rank)
-            summary = transcriber(
-                synthesis_records=synthesis_records,
-                recognizer=model,
-                output_dir=paths,
-                rank=context.rank,
-                world_size=context.world_size,
-                deadline_monotonic=args.deadline_monotonic,
-                stop_requested=stop_requested,
-            )
-        except Exception as error:  # noqa: BLE001 - durable lifecycle failure contract
-            summary = failure_persister(
-                synthesis_records=synthesis_records,
-                output_dir=paths,
-                rank=context.rank,
-                world_size=context.world_size,
-                error=error,
-            )
-        finally:
-            model = None
-            gc.collect()
-
-        synchronized = synchronizer()
+        if summary is None:
+            raise RuntimeError("ASR returned no summary")
         hypotheses_complete = False
         if synchronized:
             try:
@@ -352,6 +363,29 @@ def _run_asr(
         )
         output(serializer(payload, ensure_ascii=False, sort_keys=True))
         return 0 if payload["complete"] else INCOMPLETE_EXIT_CODE
+
+
+def _asr_stop_reason(
+    deadline_monotonic: float | None, stop_requested: Callable[[], bool]
+) -> str | None:
+    if stop_requested():
+        return "signal"
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        return "deadline"
+    return None
+
+
+def _incomplete_asr_summary(rank: int, stop_reason: str) -> AsrSummary:
+    return AsrSummary(
+        rank=rank,
+        expected=HARD_NUMBER_COUNT // 8,
+        completed=0,
+        transcribed=0,
+        skipped=0,
+        failed=0,
+        complete=False,
+        stop_reason=stop_reason,
+    )
 
 
 def _valid_synthesis_wav(record: dict[str, Any]) -> bool:

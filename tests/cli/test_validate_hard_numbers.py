@@ -13,8 +13,8 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import numpy as np
+import pytest
 import soundfile as sf
 
 import omnivoice.cli.validate_hard_numbers as validation_cli
@@ -24,7 +24,7 @@ from omnivoice.cli.validate_hard_numbers import (
     _run_synth,
     build_parser,
 )
-from omnivoice.validation.artifacts import ValidationPaths
+from omnivoice.validation.artifacts import AtomicJsonlLedger, ValidationPaths
 from omnivoice.validation.asr import AsrSummary
 from omnivoice.validation.synthesis import (
     DistributedContext,
@@ -235,6 +235,42 @@ def test_run_asr_requires_global_hypothesis_coverage_after_synchronization(
     assert json.loads(output[0])["complete"] is False
 
 
+def test_run_asr_accepts_complete_global_hypothesis_coverage(
+    tmp_path: Path,
+) -> None:
+    """Catches a global ASR gate that rejects all valid 2,000-row ledger sets."""
+    args, assignments, synthesis_records = _valid_asr_stage_inputs(tmp_path)
+    paths = ValidationPaths(tmp_path, "run-1", 0)
+    for record in synthesis_records:
+        AtomicJsonlLedger(paths.rank_hypotheses(record["rank"])).upsert(
+            {"hypothesis": "ok", "id": record["id"], "rank": record["rank"]}
+        )
+    output: list[str] = []
+
+    code = _run_asr(
+        args,
+        assignment_loader=lambda path: assignments,
+        context_resolver=lambda: DistributedContext(0, 0, 8),
+        synthesis_merger=lambda paths: synthesis_records,
+        model_loader=lambda local_rank: object(),
+        transcriber=lambda **kwargs: AsrSummary(
+            rank=0,
+            expected=250,
+            completed=250,
+            transcribed=0,
+            skipped=250,
+            failed=0,
+            complete=True,
+            stop_reason=None,
+        ),
+        synchronizer=lambda: True,
+        output=output.append,
+    )
+
+    assert code == 0
+    assert json.loads(output[0])["complete"] is True
+
+
 def test_run_asr_expired_deadline_skips_gigaam_load_and_synchronizes(
     tmp_path: Path,
 ) -> None:
@@ -288,6 +324,44 @@ def test_run_asr_preload_signal_skips_gigaam_load_and_synchronizes(
 
     assert code == INCOMPLETE_EXIT_CODE
     assert loaded == []
+    assert synchronized == [True]
+
+
+def test_run_asr_signal_during_load_skips_transcription_and_synchronizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a SIGTERM arriving during GigaAM loading that starts transcription."""
+    args, assignments, synthesis_records = _valid_asr_stage_inputs(tmp_path)
+    stopped = [False]
+    transcribed: list[bool] = []
+    synchronized: list[bool] = []
+
+    class _SignalDuringLoad:
+        def __enter__(self):
+            return lambda: stopped[0]
+
+        def __exit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+    def load(local_rank: int) -> object:
+        del local_rank
+        stopped[0] = True
+        return object()
+
+    monkeypatch.setattr(validation_cli, "_SigtermFlag", _SignalDuringLoad)
+    code = _run_asr(
+        args,
+        assignment_loader=lambda path: assignments,
+        context_resolver=lambda: DistributedContext(0, 0, 8),
+        synthesis_merger=lambda paths: synthesis_records,
+        model_loader=load,
+        transcriber=lambda **kwargs: transcribed.append(True),
+        synchronizer=lambda: synchronized.append(True) or True,
+        output=lambda payload: None,
+    )
+
+    assert code == INCOMPLETE_EXIT_CODE
+    assert transcribed == []
     assert synchronized == [True]
 
 
