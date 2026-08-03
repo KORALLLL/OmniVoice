@@ -72,3 +72,10 @@
 - Changed: One immutable Hugging Face commit is now pinned from preflight through local step-0 synthesis, train CLI overrides, LoRA metadata, checkpoint validation, adapter synthesis, and resume. New imported checkpoints still undergo base step-0 validation first. Deadline checks precede every external preflight/preparation operation, and restartable checkpoints require nonempty regular Accelerate optimizer/scheduler state files.
 - Validation: Task 11 passed 33 focused and 201 relevant Task 3/8/11 tests plus Ruff, compileall, Bash/JSON syntax, and diff checks. Scoped re-review marked both Critical and all three Important findings addressed with no new breakage.
 - Follow-up: The validation config's W&B project is used for preflight while the score CLI currently relies on Task 10's fixed default project; this deferred Minor is reserved for final review. Real authenticated W&B/HF/eight-GPU execution and deadline behavior remain Task 12 work.
+
+## 2026-08-03 - Task 12 real-run preflight checkpoint
+
+- Completed: The exact Task 12 static gate is green after the declared development-tool bootstrap correction: Ruff, compileall, launcher/config syntax, lock consistency, and `403` tests pass. The bootstrap correction was independently reviewed clean and pushed in `3e29d5c`.
+- Preflight: Hugging Face authentication passed as `korallll`. W&B preflight stopped at `wandb status`: it reports `api_key: null` (while targeting `api.wandb.ai`). Offline mode was deliberately not used.
+- Not started: GPU inventory, deterministic Balalaika selection, notifications, the shared monotonic deadline, memorization, smoke synthesis, base 2,000-utterance validation, W&B run creation, and runtime audio/checkpoint artifacts. The preserved budget remains `paths=0/1`, `retries=0/0`, and `GPU minutes=0`.
+- Next: Run `wandb login` in this environment, then resume Task 12 from its strict preflight sequence. Do not count this stopped preflight as a run path or retry. Current exact execution evidence is retained in the ignored Task 12 report and `/root/ml-intern-runs/omnivoice-bal-hard-number/` ledgers.
