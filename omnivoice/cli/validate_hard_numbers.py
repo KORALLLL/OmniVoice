@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import builtins
+import gc
 import json
 import math
 import os
@@ -17,7 +18,20 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any
 
-from omnivoice.validation.artifacts import ValidationPaths
+import soundfile as sf
+
+from omnivoice.validation.artifacts import (
+    ValidationPaths,
+    merge_rank_ledgers,
+    require_exact_coverage,
+    valid_completed_ids,
+)
+from omnivoice.validation.asr import (
+    load_gigaam,
+    persist_rank_failure,
+    transcribe_rank,
+)
+from omnivoice.validation.hard_numbers import HARD_NUMBER_COUNT
 from omnivoice.validation.synthesis import (
     LifecycleError,
     SynthesisSummary,
@@ -164,6 +178,12 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--model")
     source.add_argument("--adapter-checkpoint", type=Path)
     synth.add_argument("--deadline-monotonic", type=_finite_float)
+    asr = stages.add_parser("asr", help="transcribe one eight-rank GigaAM stage")
+    asr.add_argument("--assignments", type=Path, required=True)
+    asr.add_argument("--output-root", type=Path, required=True)
+    asr.add_argument("--run-id", required=True)
+    asr.add_argument("--step", type=int, required=True)
+    asr.add_argument("--deadline-monotonic", type=_finite_float)
     return parser
 
 
@@ -216,6 +236,120 @@ class _FinalSigtermBoundary:
         del exc_type, exc, traceback
         if self.previous_mask is not None:
             signal.pthread_sigmask(signal.SIG_SETMASK, self.previous_mask)
+
+
+def _run_asr(
+    args: argparse.Namespace,
+    *,
+    assignment_loader: Callable[[Path], Any] = load_assignment_manifest,
+    context_resolver: Callable[[], Any] = resolve_distributed_context,
+    synthesis_merger: Callable[[Any], list[dict[str, Any]]] = merge_rank_ledgers,
+    model_loader: Callable[[int], Any] = load_gigaam,
+    transcriber: Callable[..., Any] = transcribe_rank,
+    failure_persister: Callable[..., Any] = persist_rank_failure,
+    synchronizer: Callable[[], bool] = synchronize_distributed,
+    output: Callable[[str], None] = _output_json,
+    serializer: Callable[..., str] = json.dumps,
+) -> int:
+    """Run one rank of ASR after exact hash-validated TTS coverage exists."""
+    context = context_resolver()
+    paths = ValidationPaths(args.output_root, args.run_id, args.step)
+    with _SigtermFlag() as stop_requested:
+        try:
+            assignments = assignment_loader(args.assignments)
+            expected_ids = [assignment.id for assignment in assignments]
+            if len(expected_ids) != HARD_NUMBER_COUNT:
+                raise ValueError(
+                    f"ASR requires exactly {HARD_NUMBER_COUNT} assignments; "
+                    f"got {len(expected_ids)}"
+                )
+            synthesis_records = synthesis_merger(
+                [paths.rank_manifest(rank) for rank in range(context.world_size)]
+            )
+            require_exact_coverage(
+                expected_ids,
+                [record.get("id") for record in synthesis_records],
+            )
+            hash_valid_ids = valid_completed_ids(
+                synthesis_records, required_files=("wav",)
+            )
+            require_exact_coverage(
+                expected_ids,
+                [
+                    record["id"]
+                    for record in synthesis_records
+                    if record.get("id") in hash_valid_ids
+                    and _valid_synthesis_wav(record)
+                ],
+            )
+        except (OSError, TypeError, ValueError) as error:
+            output(
+                serializer(
+                    {"complete": False, "stage": "synthesis_coverage"},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            del error
+            return INCOMPLETE_EXIT_CODE
+
+        model = None
+        try:
+            if stop_requested():
+                output(
+                    serializer(
+                        {"complete": False, "stage": "signal"},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                return INCOMPLETE_EXIT_CODE
+            model = model_loader(context.local_rank)
+            summary = transcriber(
+                synthesis_records=synthesis_records,
+                recognizer=model,
+                output_dir=paths,
+                rank=context.rank,
+                world_size=context.world_size,
+                deadline_monotonic=args.deadline_monotonic,
+                stop_requested=stop_requested,
+            )
+        except Exception as error:  # noqa: BLE001 - durable lifecycle failure contract
+            summary = failure_persister(
+                synthesis_records=synthesis_records,
+                output_dir=paths,
+                rank=context.rank,
+                world_size=context.world_size,
+                error=error,
+            )
+        finally:
+            model = None
+            gc.collect()
+
+        synchronized = synchronizer()
+        payload = asdict(summary)
+        payload["synchronized"] = synchronized
+        payload["complete"] = bool(summary.complete and synchronized)
+        output(serializer(payload, ensure_ascii=False, sort_keys=True))
+        return 0 if payload["complete"] else INCOMPLETE_EXIT_CODE
+
+
+def _valid_synthesis_wav(record: dict[str, Any]) -> bool:
+    """Reject hashed artifacts that are not TTS's mono 24 kHz PCM WAVs."""
+    raw_path = record.get("wav")
+    if not isinstance(raw_path, str) or not raw_path:
+        return False
+    try:
+        info = sf.info(raw_path)
+    except (OSError, RuntimeError):
+        return False
+    return (
+        info.format == "WAV"
+        and info.subtype == "PCM_16"
+        and info.samplerate == 24_000
+        and info.channels == 1
+        and info.frames > 0
+    )
 
 
 def _run_synth(
@@ -481,6 +615,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.stage == "synth":
         return _run_synth(args)
+    if args.stage == "asr":
+        return _run_asr(args)
     raise AssertionError(f"unsupported validation stage {args.stage!r}")
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import json
 import os
 import signal
@@ -16,10 +17,12 @@ import pytest
 
 from omnivoice.cli.validate_hard_numbers import (
     INCOMPLETE_EXIT_CODE,
+    _run_asr,
     _run_synth,
     build_parser,
 )
 from omnivoice.validation.artifacts import ValidationPaths
+from omnivoice.validation.asr import AsrSummary
 from omnivoice.validation.synthesis import (
     DistributedContext,
     ModelSourceIdentity,
@@ -74,6 +77,97 @@ def test_synth_parser_requires_exactly_one_model_source(tmp_path: Path) -> None:
     parsed = parser.parse_args(common + ["--model", "k2-fsa/OmniVoice"])
     assert parsed.assignments == tmp_path / "assignments.jsonl"
     assert parsed.deadline_monotonic is None
+
+
+def test_run_asr_rejects_invalid_synthesis_coverage_before_loading_gigaam(
+    tmp_path: Path,
+) -> None:
+    """Catches a CLI change that loads GigaAM before all 2,000 valid WAVs exist."""
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run-1",
+        step=0,
+        deadline_monotonic=None,
+    )
+    assignments = [SimpleNamespace(id=f"utt-{index:04d}") for index in range(2_000)]
+    synthesis_records = [
+        {"id": assignment.id, "rank": index % 8}
+        for index, assignment in enumerate(assignments)
+    ]
+    loaded: list[bool] = []
+    output: list[str] = []
+
+    code = _run_asr(
+        args,
+        assignment_loader=lambda path: assignments,
+        context_resolver=lambda: DistributedContext(0, 0, 8),
+        synthesis_merger=lambda paths: synthesis_records,
+        model_loader=lambda local_rank: loaded.append(True),
+        output=output.append,
+    )
+
+    assert code == INCOMPLETE_EXIT_CODE
+    assert loaded == []
+    assert json.loads(output[0]) == {
+        "complete": False,
+        "stage": "synthesis_coverage",
+    }
+
+
+def test_run_asr_rejects_non_wav_synthesis_artifacts_before_loading_gigaam(
+    tmp_path: Path,
+) -> None:
+    """Catches a coverage check that trusts a hash without checking WAV validity."""
+    args = SimpleNamespace(
+        assignments=tmp_path / "assignments.jsonl",
+        output_root=tmp_path,
+        run_id="run-1",
+        step=0,
+        deadline_monotonic=None,
+    )
+    invalid_wav = tmp_path / "not-a-wav.wav"
+    invalid_wav.write_bytes(b"hash-valid but not a WAV")
+    digest = hashlib.sha256(invalid_wav.read_bytes()).hexdigest()
+    assignments = [SimpleNamespace(id=f"utt-{index:04d}") for index in range(2_000)]
+    synthesis_records = [
+        {
+            "id": assignment.id,
+            "rank": index % 8,
+            "sha256": digest,
+            "wav": str(invalid_wav),
+        }
+        for index, assignment in enumerate(assignments)
+    ]
+    loaded: list[bool] = []
+    output: list[str] = []
+
+    code = _run_asr(
+        args,
+        assignment_loader=lambda path: assignments,
+        context_resolver=lambda: DistributedContext(0, 0, 8),
+        synthesis_merger=lambda paths: synthesis_records,
+        model_loader=lambda local_rank: loaded.append(True) or object(),
+        transcriber=lambda **kwargs: AsrSummary(
+            rank=0,
+            expected=250,
+            completed=250,
+            transcribed=0,
+            skipped=250,
+            failed=0,
+            complete=True,
+            stop_reason=None,
+        ),
+        synchronizer=lambda: True,
+        output=output.append,
+    )
+
+    assert code == INCOMPLETE_EXIT_CODE
+    assert loaded == []
+    assert json.loads(output[0]) == {
+        "complete": False,
+        "stage": "synthesis_coverage",
+    }
 
 
 @pytest.mark.parametrize(
