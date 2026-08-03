@@ -134,6 +134,17 @@ def _error_record(identifier: str, rank: int, error: BaseException) -> dict[str,
     }
 
 
+def _owned_ledger_records(ledger: AtomicJsonlLedger, rank: int) -> dict[str, Any]:
+    """Reject malformed or cross-rank rows before resume can trust them."""
+    records = {record["id"]: record for record in ledger.records}
+    for identifier, record in records.items():
+        if type(record.get("rank")) is not int or record["rank"] != rank:
+            raise ValueError(
+                f"rank hypothesis ledger record {identifier!r} has foreign or malformed rank"
+            )
+    return records
+
+
 def persist_rank_failure(
     *,
     synthesis_records: Sequence[Mapping[str, Any]],
@@ -150,7 +161,7 @@ def persist_rank_failure(
     records = _validate_synthesis_records(synthesis_records, world_size=world_size)
     local_records = [record for record in records if record["rank"] == rank]
     ledger = AtomicJsonlLedger(_rank_hypotheses_path(output_dir, rank))
-    existing = {record["id"]: record for record in ledger.records}
+    existing = _owned_ledger_records(ledger, rank)
     expected_ids = {record["id"] for record in local_records}
     extras = sorted(set(existing) - expected_ids)
     if extras:
@@ -204,7 +215,7 @@ def transcribe_rank(
     records = _validate_synthesis_records(synthesis_records, world_size=world_size)
     local_records = [record for record in records if record["rank"] == rank]
     ledger = AtomicJsonlLedger(_rank_hypotheses_path(output_dir, rank))
-    existing = {record["id"]: record for record in ledger.records}
+    existing = _owned_ledger_records(ledger, rank)
     expected_ids = {record["id"] for record in local_records}
     extras = sorted(set(existing) - expected_ids)
     if extras:

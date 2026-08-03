@@ -5,10 +5,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 from omnivoice.validation.artifacts import AtomicJsonlLedger, ValidationPaths
-from omnivoice.validation.asr import transcribe_rank
+from omnivoice.validation.asr import persist_rank_failure, transcribe_rank
 
 
 class _FakeRecognizer:
@@ -135,3 +136,31 @@ def test_transcribe_rank_persists_recognition_failure_without_marking_it_complet
         "id": "utt-0003",
         "rank": 3,
     }
+
+
+def test_rank_resume_rejects_hypotheses_owned_by_a_different_rank(
+    tmp_path: Path,
+) -> None:
+    """Catches resume code that accepts a local ID whose ledger rank is foreign."""
+    records = _synthesis_records(tmp_path)
+    paths = ValidationPaths(tmp_path, "run-1", 0)
+    AtomicJsonlLedger(paths.rank_hypotheses(3)).upsert(
+        {"hypothesis": "foreign", "id": "utt-0003", "rank": 4}
+    )
+
+    with pytest.raises(ValueError, match="rank"):
+        transcribe_rank(
+            synthesis_records=records,
+            recognizer=_FakeRecognizer(),
+            output_dir=paths,
+            rank=3,
+            world_size=8,
+        )
+    with pytest.raises(ValueError, match="rank"):
+        persist_rank_failure(
+            synthesis_records=records,
+            output_dir=paths,
+            rank=3,
+            world_size=8,
+            error=RuntimeError("GigaAM load failed"),
+        )

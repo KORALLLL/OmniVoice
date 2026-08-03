@@ -327,9 +327,29 @@ def _run_asr(
             gc.collect()
 
         synchronized = synchronizer()
+        hypotheses_complete = False
+        if synchronized:
+            try:
+                hypothesis_records = merge_rank_ledgers(
+                    [paths.rank_hypotheses(rank) for rank in range(context.world_size)]
+                )
+                require_exact_coverage(
+                    expected_ids,
+                    [record.get("id") for record in hypothesis_records],
+                )
+                require_exact_coverage(
+                    expected_ids,
+                    valid_completed_ids(hypothesis_records),
+                )
+            except (OSError, TypeError, ValueError):
+                hypotheses_complete = False
+            else:
+                hypotheses_complete = True
         payload = asdict(summary)
         payload["synchronized"] = synchronized
-        payload["complete"] = bool(summary.complete and synchronized)
+        payload["complete"] = bool(
+            summary.complete and synchronized and hypotheses_complete
+        )
         output(serializer(payload, ensure_ascii=False, sort_keys=True))
         return 0 if payload["complete"] else INCOMPLETE_EXIT_CODE
 

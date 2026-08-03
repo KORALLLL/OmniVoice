@@ -14,7 +14,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
+import soundfile as sf
 
+import omnivoice.cli.validate_hard_numbers as validation_cli
 from omnivoice.cli.validate_hard_numbers import (
     INCOMPLETE_EXIT_CODE,
     _run_asr,
@@ -32,6 +35,35 @@ from omnivoice.validation.synthesis import (
 )
 
 _EXCEPTION_GROUP = builtins.ExceptionGroup
+
+
+def _valid_asr_stage_inputs(
+    tmp_path: Path, *, deadline_monotonic: float | None = None
+) -> tuple[SimpleNamespace, list[SimpleNamespace], list[dict[str, object]]]:
+    wav_path = tmp_path / "synthesis.wav"
+    sf.write(wav_path, np.array([0.25], dtype=np.float32), 24_000, subtype="PCM_16")
+    digest = hashlib.sha256(wav_path.read_bytes()).hexdigest()
+    assignments = [SimpleNamespace(id=f"utt-{index:04d}") for index in range(2_000)]
+    records = [
+        {
+            "id": assignment.id,
+            "rank": index % 8,
+            "sha256": digest,
+            "wav": str(wav_path),
+        }
+        for index, assignment in enumerate(assignments)
+    ]
+    return (
+        SimpleNamespace(
+            assignments=tmp_path / "assignments.jsonl",
+            output_root=tmp_path,
+            run_id="run-1",
+            step=0,
+            deadline_monotonic=deadline_monotonic,
+        ),
+        assignments,
+        records,
+    )
 
 
 def _source_identity(
@@ -168,6 +200,95 @@ def test_run_asr_rejects_non_wav_synthesis_artifacts_before_loading_gigaam(
         "complete": False,
         "stage": "synthesis_coverage",
     }
+
+
+def test_run_asr_requires_global_hypothesis_coverage_after_synchronization(
+    tmp_path: Path,
+) -> None:
+    """Catches a rank-local complete summary that bypasses the 2,000-row ASR gate."""
+    args, assignments, synthesis_records = _valid_asr_stage_inputs(tmp_path)
+    output: list[str] = []
+    synchronized: list[bool] = []
+
+    code = _run_asr(
+        args,
+        assignment_loader=lambda path: assignments,
+        context_resolver=lambda: DistributedContext(0, 0, 8),
+        synthesis_merger=lambda paths: synthesis_records,
+        model_loader=lambda local_rank: object(),
+        transcriber=lambda **kwargs: AsrSummary(
+            rank=0,
+            expected=250,
+            completed=250,
+            transcribed=250,
+            skipped=0,
+            failed=0,
+            complete=True,
+            stop_reason=None,
+        ),
+        synchronizer=lambda: synchronized.append(True) or True,
+        output=output.append,
+    )
+
+    assert synchronized == [True]
+    assert code == INCOMPLETE_EXIT_CODE
+    assert json.loads(output[0])["complete"] is False
+
+
+def test_run_asr_expired_deadline_skips_gigaam_load_and_synchronizes(
+    tmp_path: Path,
+) -> None:
+    """Catches an expired ASR deadline that still loads GigaAM before cleanup."""
+    args, assignments, synthesis_records = _valid_asr_stage_inputs(
+        tmp_path, deadline_monotonic=0.0
+    )
+    loaded: list[bool] = []
+    synchronized: list[bool] = []
+
+    code = _run_asr(
+        args,
+        assignment_loader=lambda path: assignments,
+        context_resolver=lambda: DistributedContext(0, 0, 8),
+        synthesis_merger=lambda paths: synthesis_records,
+        model_loader=lambda local_rank: loaded.append(True) or object(),
+        synchronizer=lambda: synchronized.append(True) or True,
+        output=lambda payload: None,
+    )
+
+    assert code == INCOMPLETE_EXIT_CODE
+    assert loaded == []
+    assert synchronized == [True]
+
+
+def test_run_asr_preload_signal_skips_gigaam_load_and_synchronizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches an early SIGTERM return that bypasses distributed teardown."""
+    args, assignments, synthesis_records = _valid_asr_stage_inputs(tmp_path)
+    loaded: list[bool] = []
+    synchronized: list[bool] = []
+
+    class _SignalAlreadyRequested:
+        def __enter__(self):
+            return lambda: True
+
+        def __exit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+    monkeypatch.setattr(validation_cli, "_SigtermFlag", _SignalAlreadyRequested)
+    code = _run_asr(
+        args,
+        assignment_loader=lambda path: assignments,
+        context_resolver=lambda: DistributedContext(0, 0, 8),
+        synthesis_merger=lambda paths: synthesis_records,
+        model_loader=lambda local_rank: loaded.append(True) or object(),
+        synchronizer=lambda: synchronized.append(True) or True,
+        output=lambda payload: None,
+    )
+
+    assert code == INCOMPLETE_EXIT_CODE
+    assert loaded == []
+    assert synchronized == [True]
 
 
 @pytest.mark.parametrize(
