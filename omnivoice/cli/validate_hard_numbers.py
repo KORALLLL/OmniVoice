@@ -260,6 +260,7 @@ def _run_asr(
         expected_ids: list[str] = []
         stage: str | None = None
         summary: AsrSummary | None = None
+        lifecycle_error: Exception | None = None
         try:
             assignments = assignment_loader(args.assignments)
             expected_ids = [assignment.id for assignment in assignments]
@@ -315,13 +316,17 @@ def _run_asr(
                             stop_requested=stop_requested,
                         )
                 except Exception as error:  # noqa: BLE001 - durable lifecycle failure contract
-                    summary = failure_persister(
-                        synthesis_records=synthesis_records,
-                        output_dir=paths,
-                        rank=context.rank,
-                        world_size=context.world_size,
-                        error=error,
-                    )
+                    lifecycle_error = error
+                    try:
+                        summary = failure_persister(
+                            synthesis_records=synthesis_records,
+                            output_dir=paths,
+                            rank=context.rank,
+                            world_size=context.world_size,
+                            error=error,
+                        )
+                    except Exception:  # noqa: BLE001 - corrupted ledger remains untrusted
+                        summary = _incomplete_asr_summary(context.rank, "error")
                 finally:
                     model = None
                     gc.collect()
@@ -357,6 +362,11 @@ def _run_asr(
             else:
                 hypotheses_complete = True
         payload = asdict(summary)
+        if lifecycle_error is not None:
+            payload["error"] = {
+                "message": str(lifecycle_error),
+                "type": type(lifecycle_error).__name__,
+            }
         payload["synchronized"] = synchronized
         payload["complete"] = bool(
             summary.complete and synchronized and hypotheses_complete

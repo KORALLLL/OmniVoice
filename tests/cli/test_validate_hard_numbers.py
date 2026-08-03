@@ -365,6 +365,39 @@ def test_run_asr_signal_during_load_skips_transcription_and_synchronizes(
     assert synchronized == [True]
 
 
+def test_run_asr_corrupt_hypothesis_ledger_synchronizes_after_both_asr_paths_reject(
+    tmp_path: Path,
+) -> None:
+    """Catches fallback persistence re-raising the same foreign-rank corruption."""
+    args, assignments, synthesis_records = _valid_asr_stage_inputs(tmp_path)
+    paths = ValidationPaths(tmp_path, "run-1", 0)
+    AtomicJsonlLedger(paths.rank_hypotheses(0)).upsert(
+        {"hypothesis": "foreign", "id": "utt-0000", "rank": 1}
+    )
+    synchronized: list[bool] = []
+    output: list[str] = []
+
+    code = _run_asr(
+        args,
+        assignment_loader=lambda path: assignments,
+        context_resolver=lambda: DistributedContext(0, 0, 8),
+        synthesis_merger=lambda paths: synthesis_records,
+        model_loader=lambda local_rank: object(),
+        synchronizer=lambda: synchronized.append(True) or True,
+        output=output.append,
+    )
+
+    assert code == INCOMPLETE_EXIT_CODE
+    assert synchronized == [True]
+    assert len(output) == 1
+    payload = json.loads(output[0])
+    assert payload["complete"] is False
+    assert payload["error"] == {
+        "message": "rank hypothesis ledger record 'utt-0000' has foreign or malformed rank",
+        "type": "ValueError",
+    }
+
+
 @pytest.mark.parametrize(
     ("source_args", "expected_source"),
     [
