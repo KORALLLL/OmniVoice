@@ -1,0 +1,9 @@
+{
+  "steps_per_epoch": 5000,
+  "dataset_repo": "bitmanagerai/hard_number_eval_for_tts",
+  "dataset_revision": "57b964492ccfcedd6a24d0225ef4b7d3697ffdca",
+  "base_model": "k2-fsa/OmniVoice",
+  "wandb_project": "omnivoice-lora-validation",
+  "world_size": 8,
+  "seed": 42
+}

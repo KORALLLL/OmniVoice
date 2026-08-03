@@ -78,3 +78,110 @@ def test_lora_example_launcher_resolves_config_from_supported_workdirs(
         "--output_dir",
         "exp/omnivoice_finetune_lora",
     ]
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd"),
+    [
+        (["bash", "examples/run_finetune_lora_with_validation.sh"], ROOT),
+        (["bash", "run_finetune_lora_with_validation.sh"], ROOT / "examples"),
+    ],
+)
+def test_validation_launcher_resolves_every_config_from_script_directory(
+    tmp_path, command, cwd
+):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    command_log = tmp_path / "commands.log"
+    python = bin_dir / "python"
+    python.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$COMMAND_LOG"\n')
+    python.chmod(0o755)
+    selected = tmp_path / "selected.jsonl"
+    selected.write_text("{}\n")
+    deadline_state = tmp_path / "result.json"
+    deadline_state.write_text('{"experiment_deadline_monotonic":12345}\n')
+    environment = os.environ | {
+        "COMMAND_LOG": str(command_log),
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "SELECTED_MANIFEST": str(selected),
+        "DEADLINE_STATE": str(deadline_state),
+    }
+
+    result = subprocess.run(
+        command,
+        cwd=cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    commands = [shlex.split(line) for line in command_log.read_text().splitlines()]
+    assert commands == [
+        [
+            "-m",
+            "omnivoice.cli.run_lora_validation",
+            "--train-config",
+            str(ROOT / "examples/config/train_config_finetune_lora.json"),
+            "--data-config",
+            str(ROOT / "examples/config/data_config_finetune.json"),
+            "--validation-config",
+            str(ROOT / "examples/config/hard_number_validation.json"),
+            "--selected-manifest",
+            str(selected),
+            "--deadline-state",
+            str(deadline_state),
+            "--output-dir",
+            str(ROOT / "exp/omnivoice_finetune_lora"),
+            "--validation-output-root",
+            str(ROOT / "exp/omnivoice_validation"),
+        ]
+    ]
+
+
+def test_validation_launcher_preserves_absolute_config_overrides(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    command_log = tmp_path / "commands.log"
+    python = bin_dir / "python"
+    python.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$COMMAND_LOG"\n')
+    python.chmod(0o755)
+    paths = {
+        name: tmp_path / name
+        for name in (
+            "train.json",
+            "data.json",
+            "validation.json",
+            "selected.jsonl",
+            "result.json",
+        )
+    }
+    for path in paths.values():
+        path.write_text("{}\n")
+    environment = os.environ | {
+        "COMMAND_LOG": str(command_log),
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "TRAIN_CONFIG": str(paths["train.json"]),
+        "DATA_CONFIG": str(paths["data.json"]),
+        "VALIDATION_CONFIG": str(paths["validation.json"]),
+        "SELECTED_MANIFEST": str(paths["selected.jsonl"]),
+        "DEADLINE_STATE": str(paths["result.json"]),
+    }
+
+    result = subprocess.run(
+        ["bash", "examples/run_finetune_lora_with_validation.sh"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(command_log.read_text())
+    assert command[command.index("--train-config") + 1] == str(paths["train.json"])
+    assert command[command.index("--data-config") + 1] == str(paths["data.json"])
+    assert command[command.index("--validation-config") + 1] == str(
+        paths["validation.json"]
+    )

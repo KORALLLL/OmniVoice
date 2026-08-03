@@ -151,6 +151,42 @@ model = OmniVoice.from_lora_pretrained(
 )
 ```
 
+### Checkpoint-isolated hard-number validation
+
+Log in before starting because the controller requires authenticated online
+W&B access before it launches any GPU subprocess:
+
+```bash
+wandb login
+SELECTED_MANIFEST=/absolute/path/to/selected.jsonl \
+DEADLINE_STATE=exp/omnivoice_lora_memorization/result.json \
+bash examples/run_finetune_lora_with_validation.sh
+```
+
+The deadline file is the memorization run's `result.json`. Reusing its
+`experiment_deadline_monotonic` makes memorization and validation share the
+same experiment clock. The controller preserves the training config's total
+`steps` and stops individual invocations at `ceil(steps_per_epoch / 8)`: this
+is approximately one eighth of an epoch, with the final shorter interval added
+when the total step count is not divisible by that value.
+
+State is written atomically to
+`exp/omnivoice_validation/controller_state.json`. Rerun the same launcher after
+an interruption; it reuses the immutable assignment hash and W&B ID, then
+repeats the exact incomplete synthesis, ASR, score, or train stage. Training
+resumes only after complete scoring and always restores from the checkpoint
+that was just validated. You can also pass `--resume-from-checkpoint` directly
+to `python -m omnivoice.cli.run_lora_validation` when importing an existing
+complete LoRA checkpoint into a new controller run.
+
+Per-run artifacts live under
+`exp/omnivoice_validation/<run-id>/`: `assignments.jsonl`, stable
+`wandb_ids.json`, and `step-<step>/` synthesis ledgers, hypotheses, merged
+metrics, `report.md`, and run metadata. The assignment manifest balances 2,000
+prompts over 20 deterministically selected reference clips. Those 20 clips are
+not guaranteed to represent 20 distinct speakers; the source dataset does not
+provide a reliable speaker-identity guarantee.
+
 ## Initializing from a Pretrained Model
 
 To start training from a pretrained OmniVoice checkpoint (for fine-tuning):
