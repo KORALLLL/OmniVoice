@@ -237,7 +237,12 @@ def resolve_base_model(model: str, revision: str | None = None) -> tuple[Path, s
     return snapshot, resolved_revision
 
 
-def require_complete_checkpoint(checkpoint: str | Path, expected_step: int) -> Path:
+def require_complete_checkpoint(
+    checkpoint: str | Path,
+    expected_step: int,
+    *,
+    expected_base_revision: str | None = None,
+) -> Path:
     """Require an exact, restartable LoRA checkpoint at ``expected_step``."""
     path = Path(checkpoint)
     if path.name != f"checkpoint-{expected_step}":
@@ -259,6 +264,22 @@ def require_complete_checkpoint(checkpoint: str | Path, expected_step: int) -> P
         adapter / "adapter_model.bin",
     ]
     tokenizer_files = [root / name for name in _TOKENIZER_FILES]
+
+    def has_accelerate_state(prefix: str) -> bool:
+        return any(
+            item.is_file() and item.stat().st_size > 0
+            for item in root.glob(f"{prefix}*.bin")
+        )
+
+    if (
+        expected_base_revision is not None
+        and metadata.get("base_model_revision") != expected_base_revision
+    ):
+        raise ValueError(
+            "checkpoint base model revision differs from controller preflight: "
+            f"checkpoint={metadata.get('base_model_revision')!r}, "
+            f"controller={expected_base_revision!r}"
+        )
     if (
         metadata.get("step") != expected_step
         or any(
@@ -270,8 +291,8 @@ def require_complete_checkpoint(checkpoint: str | Path, expected_step: int) -> P
         or not any(
             item.is_file() and item.stat().st_size > 0 for item in tokenizer_files
         )
-        or not any(root.glob("optimizer*"))
-        or not any(root.glob("scheduler*"))
+        or not has_accelerate_state("optimizer")
+        or not has_accelerate_state("scheduler")
     ):
         raise FileNotFoundError(f"complete checkpoint is missing: {path}")
     return root
@@ -369,10 +390,6 @@ class ValidationController:
         assignments = self.validation_output_root / run_id / "assignments.jsonl"
         step = 0
         checkpoint = None
-        stage = "preflight"
-        base_validated = False
-        pending_step = None
-        pending_checkpoint = None
         if self.resume_from_checkpoint is not None:
             try:
                 step = int(self.resume_from_checkpoint.name.removeprefix("checkpoint-"))
@@ -382,20 +399,16 @@ class ValidationController:
                 ) from error
             require_complete_checkpoint(self.resume_from_checkpoint, step)
             checkpoint = str(self.resume_from_checkpoint)
-            pending_step = step
-            pending_checkpoint = checkpoint
-            base_validated = True
-            stage = "synth"
         state = ControllerState(
             run_id=run_id,
             wandb_id=None,
-            stage=stage,
-            step=step if stage == "preflight" else 0,
-            checkpoint=None if stage != "preflight" else checkpoint,
-            pending_step=pending_step,
-            pending_checkpoint=pending_checkpoint,
+            stage="preflight",
+            step=step,
+            checkpoint=checkpoint,
+            pending_step=None,
+            pending_checkpoint=None,
             pending_dev_loss=None,
-            base_validated=base_validated,
+            base_validated=False,
             deadline_monotonic=self.deadline_monotonic,
             resolved_base_path=None,
             resolved_base_revision=None,
@@ -410,6 +423,14 @@ class ValidationController:
         )
         self._write_state(state)
         return state
+
+    def _require_deadline(self, state: ControllerState, operation: str) -> None:
+        if self.monotonic() < self.deadline_monotonic:
+            return
+        state.command_status = "failed"
+        state.last_error = f"experiment deadline reached before {operation}"
+        self._write_state(state)
+        raise TimeoutError(state.last_error)
 
     def _load_state(self) -> ControllerState:
         if not self.state_path.exists():
@@ -439,16 +460,19 @@ class ValidationController:
         return state
 
     def _preflight(self, state: ControllerState) -> None:
+        self._require_deadline(state, "W&B preflight")
         paths = ValidationPaths(
             self.validation_output_root, state.run_id, state.pending_step or state.step
         )
         store = self.wandb_store_factory(paths.wandb_ids, self.validation.wandb_project)
         store.preflight()
+        self._require_deadline(state, "W&B identity")
         wandb_id = store.load_or_create_id()
         if state.wandb_id is not None and state.wandb_id != wandb_id:
             raise ValueError("persisted W&B identity changed during resume")
         state.wandb_id = wandb_id
 
+        self._require_deadline(state, "Hugging Face preflight")
         base_path, revision = self.base_resolver(
             self.validation.base_model, state.resolved_base_revision
         )
@@ -460,8 +484,16 @@ class ValidationController:
         state.resolved_base_path = str(base_path)
         state.resolved_base_revision = revision
 
+        if state.checkpoint is not None and not state.base_validated:
+            require_complete_checkpoint(
+                state.checkpoint,
+                state.step,
+                expected_base_revision=revision,
+            )
+
         assignments_path = Path(state.assignments_path)
         if state.assignments_sha256 is None:
+            self._require_deadline(state, "assignment preparation")
             prepared = self.assignment_preparer(
                 self.selected_manifest, assignments_path, self.validation
             )
@@ -597,6 +629,10 @@ class ValidationController:
             str(self.output_dir),
             "--stop-after-step",
             str(state.pending_step),
+            "--init-from-checkpoint",
+            state.resolved_base_path,
+            "--base-model-revision",
+            state.resolved_base_revision,
         ]
         if state.checkpoint is not None:
             command.extend(["--resume-from-checkpoint", state.checkpoint])
@@ -621,8 +657,13 @@ class ValidationController:
                     state.stage = "score"
                 elif state.pending_step == 0:
                     state.base_validated = True
-                    state.pending_step = None
-                    state.stage = "train"
+                    if state.checkpoint is None:
+                        state.pending_step = None
+                        state.stage = "train"
+                    else:
+                        state.pending_step = state.step
+                        state.pending_checkpoint = state.checkpoint
+                        state.stage = "synth"
                 else:
                     state.step = state.pending_step
                     state.checkpoint = state.pending_checkpoint
@@ -648,7 +689,9 @@ class ValidationController:
                         result.stdout, expected_step=state.pending_step
                     )
                     require_complete_checkpoint(
-                        state.pending_checkpoint, expected_step=state.pending_step
+                        state.pending_checkpoint,
+                        expected_step=state.pending_step,
+                        expected_base_revision=state.resolved_base_revision,
                     )
                 except BaseException as error:
                     state.command_status = "failed"

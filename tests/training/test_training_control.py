@@ -749,6 +749,10 @@ def test_cli_overrides_take_precedence_without_mutating_json(
             "8",
             "--resume-from-checkpoint",
             "checkpoint-4",
+            "--init-from-checkpoint",
+            "/hub/models--k2-fsa--OmniVoice/snapshots/" + "a" * 40,
+            "--base-model-revision",
+            "a" * 40,
         ],
     )
 
@@ -756,6 +760,10 @@ def test_cli_overrides_take_precedence_without_mutating_json(
 
     assert captured["config"].stop_after_step == 8
     assert captured["config"].resume_from_checkpoint == "checkpoint-4"
+    assert captured["config"].init_from_checkpoint == (
+        "/hub/models--k2-fsa--OmniVoice/snapshots/" + "a" * 40
+    )
+    assert captured["config"].base_model_revision == "a" * 40
     assert config_path.read_bytes() == original_bytes
     assert json.loads(capsys.readouterr().out) == asdict(
         TrainingOutcome(8, "stop_after_step", 0.1, False)

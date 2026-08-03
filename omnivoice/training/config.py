@@ -23,9 +23,12 @@ in ``omnivoice.cli.train``.
 
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, field
 
 from omnivoice.training.lora import DEFAULT_LORA_TARGET_MODULES
+
+_HUB_COMMIT = re.compile(r"^[0-9a-f]{40,64}$")
 
 
 @dataclass
@@ -57,6 +60,7 @@ class TrainingConfig:
     # Init settings
     resume_from_checkpoint: str | None = None
     init_from_checkpoint: str | None = None
+    base_model_revision: str | None = None
 
     # LoRA fine-tuning
     lora_enabled: bool = False
@@ -145,6 +149,11 @@ class TrainingConfig:
             or not self.eval_history_path.strip()
         ):
             raise ValueError("eval_history_path must be a non-empty string")
+        if self.base_model_revision is not None and (
+            not isinstance(self.base_model_revision, str)
+            or not _HUB_COMMIT.fullmatch(self.base_model_revision)
+        ):
+            raise ValueError("base_model_revision must be an immutable Hub commit")
         return self
 
     @classmethod

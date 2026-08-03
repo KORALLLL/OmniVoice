@@ -621,6 +621,28 @@ def test_base_source_resolves_to_immutable_snapshot_before_gpu_load(
     ]
 
 
+def test_base_source_accepts_preflight_resolved_local_snapshot_without_download(
+    tmp_path: Path,
+) -> None:
+    commit = "d" * 40
+    snapshot = tmp_path / "models--k2-fsa--OmniVoice" / "snapshots" / commit
+    snapshot.mkdir(parents=True)
+
+    def reject_download(**kwargs):
+        raise AssertionError(f"local snapshot unexpectedly downloaded: {kwargs}")
+
+    source = resolve_model_source(
+        model_name=str(snapshot), snapshot_resolver=reject_download
+    )
+
+    assert source == ModelSourceIdentity(
+        kind="base",
+        requested=str(snapshot),
+        load_path=str(snapshot.resolve()),
+        immutable_id=f"hf:{commit}",
+    )
+
+
 def _adapter_checkpoint(root: Path) -> Path:
     checkpoint = root / "checkpoint-625"
     adapter = checkpoint / "adapter"

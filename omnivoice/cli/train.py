@@ -51,6 +51,8 @@ def main():
     )
     parser.add_argument("--stop-after-step", type=int)
     parser.add_argument("--resume-from-checkpoint")
+    parser.add_argument("--init-from-checkpoint")
+    parser.add_argument("--base-model-revision")
     args = parser.parse_args()
 
     # 1. Load Configuration
@@ -61,6 +63,10 @@ def main():
         config.stop_after_step = args.stop_after_step
     if args.resume_from_checkpoint is not None:
         config.resume_from_checkpoint = args.resume_from_checkpoint
+    if args.init_from_checkpoint is not None:
+        config.init_from_checkpoint = args.init_from_checkpoint
+    if args.base_model_revision is not None:
+        config.base_model_revision = args.base_model_revision
     config.validate()
 
     # 2. Build Components

@@ -197,7 +197,7 @@ def _lora_metadata(model, config, step):
             "Live LoRA adapter differs from training config:\n- "
             + "\n- ".join(differences)
         )
-    return {
+    metadata = {
         "format_version": LORA_METADATA_FORMAT_VERSION,
         "base_model_name_or_path": configured_base,
         "step": step,
@@ -206,6 +206,9 @@ def _lora_metadata(model, config, step):
         **live_values,
         "lora_target_modules": configured_targets,
     }
+    if config.base_model_revision is not None:
+        metadata["base_model_revision"] = config.base_model_revision
+    return metadata
 
 
 def _normalize_base_identifier(value):
@@ -229,6 +232,7 @@ def validate_resume_metadata(config, metadata):
     """Reject every incompatible adapter setting in one diagnostic."""
     expected = {
         "base_model_name_or_path": config.init_from_checkpoint,
+        "base_model_revision": config.base_model_revision,
         "lora_rank": config.lora_rank,
         "lora_alpha": config.lora_alpha,
         "lora_dropout": config.lora_dropout,

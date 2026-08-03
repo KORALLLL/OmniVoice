@@ -156,7 +156,9 @@ def save_checkpoint_after_one_step(tmp_path, base_model):
     )
 
 
-def save_checkpoint_with_resolved_hub_base(tmp_path, base_model):
+def save_checkpoint_with_resolved_hub_base(
+    tmp_path, base_model, *, base_model_revision=None
+):
     snapshot_path = (
         tmp_path
         / "hub"
@@ -173,6 +175,7 @@ def save_checkpoint_with_resolved_hub_base(tmp_path, base_model):
         lora_rank=4,
         lora_alpha=8,
         steps=2,
+        base_model_revision=base_model_revision,
     )
     model, _ = apply_lora(base_model, config)
     assert model.peft_config[model.active_adapter].base_model_name_or_path == str(
@@ -303,6 +306,36 @@ def test_hub_snapshot_identity_still_rejects_a_different_base(
     with pytest.raises(ValueError, match="base_model_name_or_path"):
         load_lora_adapter(
             ToyOmniVoice(), checkpoint, config=config, is_trainable=True
+        )
+
+
+def test_lora_checkpoint_records_and_verifies_pinned_base_revision(
+    tmp_path, toy_omnivoice
+):
+    revision = "a" * 40
+    checkpoint = save_checkpoint_with_resolved_hub_base(
+        tmp_path,
+        toy_omnivoice,
+        base_model_revision=revision,
+    )
+
+    assert read_lora_metadata(checkpoint)["base_model_revision"] == revision
+
+    matching = TrainingConfig(
+        init_from_checkpoint="k2-fsa/OmniVoice",
+        base_model_revision=revision,
+        lora_enabled=True,
+        lora_rank=4,
+        lora_alpha=8,
+        steps=2,
+    )
+    load_lora_adapter(ToyOmniVoice(), checkpoint, config=matching, is_trainable=True)
+
+    mismatched = copy.deepcopy(matching)
+    mismatched.base_model_revision = "b" * 40
+    with pytest.raises(ValueError, match="base_model_revision"):
+        load_lora_adapter(
+            ToyOmniVoice(), checkpoint, config=mismatched, is_trainable=True
         )
 
 

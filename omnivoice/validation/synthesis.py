@@ -249,7 +249,18 @@ def resolve_model_source(
     if model_name is not None:
         if not isinstance(model_name, str) or not model_name.strip():
             raise ValueError("model_name must be a non-blank string")
-        snapshot = Path(snapshot_resolver(repo_id=model_name)).resolve()
+        requested_path = Path(model_name).expanduser()
+        if requested_path.is_dir():
+            snapshot = requested_path.resolve()
+            if (
+                snapshot.parent.name != "snapshots"
+                or not snapshot.parent.parent.name.startswith("models--")
+            ):
+                raise ValueError(
+                    "local base model must be an immutable Hub snapshot directory"
+                )
+        else:
+            snapshot = Path(snapshot_resolver(repo_id=model_name)).resolve()
         if not snapshot.is_dir() or not _HUB_COMMIT.fullmatch(snapshot.name):
             raise ValueError(
                 "base model did not resolve to an immutable Hub snapshot directory"

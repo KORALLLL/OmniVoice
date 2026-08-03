@@ -8,9 +8,12 @@ import pytest
 
 from omnivoice.validation.controller import (
     ValidationController,
+    require_complete_checkpoint,
     validation_boundaries,
     validation_interval_steps,
 )
+
+BASE_COMMIT = "a" * 40
 
 
 def _write_configs(tmp_path: Path, *, steps: int = 1400) -> tuple[Path, Path, Path]:
@@ -44,13 +47,25 @@ def _write_configs(tmp_path: Path, *, steps: int = 1400) -> tuple[Path, Path, Pa
     return train_config, data_config, validation_config
 
 
-def _publish_checkpoint(output_dir: Path, step: int, *, complete: bool = True) -> None:
+def _publish_checkpoint(
+    output_dir: Path,
+    step: int,
+    *,
+    complete: bool = True,
+    base_model_revision: str = BASE_COMMIT,
+) -> None:
     checkpoint = output_dir / f"checkpoint-{step}"
     adapter = checkpoint / "adapter"
     adapter.mkdir(parents=True)
     (adapter / "adapter_config.json").write_text("{}\n")
     (checkpoint / "adapter_metadata.json").write_text(
-        json.dumps({"format_version": 1, "step": step})
+        json.dumps(
+            {
+                "format_version": 1,
+                "step": step,
+                "base_model_revision": base_model_revision,
+            }
+        )
     )
     if complete:
         (adapter / "adapter_model.safetensors").write_bytes(b"adapter")
@@ -70,6 +85,7 @@ class FakeStore:
         self.calls.append("wandb-preflight")
 
     def load_or_create_id(self) -> str:
+        self.calls.append("wandb-id")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text('{"run_id":"stable-wandb-id"}\n')
         return "stable-wandb-id"
@@ -99,6 +115,7 @@ class Harness:
         steps: int = 1400,
         fail_stage: str | None = None,
         incomplete_checkpoint: bool = False,
+        checkpoint_revision: str = BASE_COMMIT,
     ) -> None:
         self.steps = steps
         self.train_config, self.data_config, self.validation_config = _write_configs(
@@ -113,6 +130,7 @@ class Harness:
         self.fail_stage = fail_stage
         self.failed = False
         self.incomplete_checkpoint = incomplete_checkpoint
+        self.checkpoint_revision = checkpoint_revision
         self.clock = AdvancingClock()
 
     def store_factory(self, path: Path, project: str) -> FakeStore:
@@ -121,8 +139,11 @@ class Harness:
     def base_resolver(self, model: str, revision: str | None = None):
         self.calls.append("hf-preflight")
         assert model == "k2-fsa/OmniVoice"
-        assert revision in (None, "base-commit")
-        return Path("/hub/snapshots/base-commit"), "base-commit"
+        assert revision in (None, BASE_COMMIT)
+        return (
+            Path("/hub/models--k2-fsa--OmniVoice/snapshots") / BASE_COMMIT,
+            BASE_COMMIT,
+        )
 
     def assignment_preparer(
         self, selected_manifest: Path, assignments_path: Path, config
@@ -160,6 +181,7 @@ class Harness:
                 self.output_dir,
                 boundary,
                 complete=not self.incomplete_checkpoint,
+                base_model_revision=self.checkpoint_revision,
             )
             stdout = json.dumps(
                 {
@@ -171,7 +193,13 @@ class Harness:
             )
         return SimpleNamespace(stdout=stdout, returncode=0)
 
-    def controller(self) -> ValidationController:
+    def controller(
+        self,
+        *,
+        resume_from_checkpoint: Path | None = None,
+        deadline_monotonic: float = 10_000.0,
+        monotonic=None,
+    ) -> ValidationController:
         return ValidationController(
             train_config=self.train_config,
             data_config=self.data_config,
@@ -179,12 +207,13 @@ class Harness:
             selected_manifest=self.selected_manifest,
             output_dir=self.output_dir,
             validation_output_root=self.validation_root,
-            deadline_monotonic=10_000.0,
+            deadline_monotonic=deadline_monotonic,
+            resume_from_checkpoint=resume_from_checkpoint,
             command_runner=self.runner,
             wandb_store_factory=self.store_factory,
             assignment_preparer=self.assignment_preparer,
             base_resolver=self.base_resolver,
-            monotonic=self.clock,
+            monotonic=monotonic or self.clock,
         )
 
 
@@ -213,9 +242,10 @@ def test_controller_runs_base_then_checkpoint_isolated_cycles(tmp_path: Path):
     observed = [_stage(command) for command in harness.commands]
     assert harness.calls[:3] == [
         "wandb-preflight",
+        "wandb-id",
         "hf-preflight",
-        "prepare-assignments",
     ]
+    assert harness.calls[3] == "prepare-assignments"
     assert observed[:9] == [
         "synth",
         "asr",
@@ -230,10 +260,16 @@ def test_controller_runs_base_then_checkpoint_isolated_cycles(tmp_path: Path):
 
     base_synth = harness.commands[0]
     assert base_synth[base_synth.index("--step") + 1] == "0"
-    assert base_synth[base_synth.index("--model") + 1] == "/hub/snapshots/base-commit"
+    assert base_synth[base_synth.index("--model") + 1] == str(
+        Path("/hub/models--k2-fsa--OmniVoice/snapshots") / BASE_COMMIT
+    )
     first_train = harness.commands[3]
     assert first_train[first_train.index("--stop-after-step") + 1] == "625"
     assert "--resume-from-checkpoint" not in first_train
+    assert first_train[first_train.index("--init-from-checkpoint") + 1] == str(
+        Path("/hub/models--k2-fsa--OmniVoice/snapshots") / BASE_COMMIT
+    )
+    assert first_train[first_train.index("--base-model-revision") + 1] == BASE_COMMIT
     first_adapter_synth = harness.commands[4]
     assert first_adapter_synth[
         first_adapter_synth.index("--adapter-checkpoint") + 1
@@ -337,6 +373,131 @@ def test_incomplete_checkpoint_halts_before_synthesis_and_retries_train(
     state = json.loads((harness.validation_root / "controller_state.json").read_text())
     assert state["stage"] == "train"
     assert state["command_status"] == "failed"
+
+
+def test_checkpoint_base_revision_must_match_controller_preflight(tmp_path: Path):
+    harness = Harness(
+        tmp_path,
+        steps=625,
+        checkpoint_revision="b" * 40,
+    )
+
+    with pytest.raises(ValueError, match="base model revision"):
+        harness.controller().run()
+
+    assert [_stage(command) for command in harness.commands][-1] == "train"
+
+
+def test_imported_checkpoint_validates_base_then_checkpoint_before_resuming(
+    tmp_path: Path,
+):
+    harness = Harness(tmp_path, steps=1250)
+    checkpoint = tmp_path / "imported" / "checkpoint-625"
+    _publish_checkpoint(checkpoint.parent, 625)
+
+    harness.controller(resume_from_checkpoint=checkpoint).run()
+
+    assert [_stage(command) for command in harness.commands[:7]] == [
+        "synth",
+        "asr",
+        "score",
+        "synth",
+        "asr",
+        "score",
+        "train",
+    ]
+    assert harness.commands[0][harness.commands[0].index("--step") + 1] == "0"
+    assert harness.commands[3][harness.commands[3].index("--step") + 1] == "625"
+    train = harness.commands[6]
+    assert train[train.index("--resume-from-checkpoint") + 1] == str(
+        checkpoint.resolve()
+    )
+    assert train[train.index("--stop-after-step") + 1] == "1250"
+
+
+@pytest.mark.parametrize(
+    ("expire_after", "expected_calls"),
+    [
+        (None, []),
+        ("wandb-preflight", ["wandb-preflight"]),
+        ("wandb-id", ["wandb-preflight", "wandb-id"]),
+        (
+            "hf-preflight",
+            ["wandb-preflight", "wandb-id", "hf-preflight"],
+        ),
+    ],
+)
+def test_deadline_is_checked_before_every_preflight_operation(
+    tmp_path: Path,
+    expire_after: str | None,
+    expected_calls: list[str],
+):
+    harness = Harness(tmp_path)
+
+    def deadline_clock() -> float:
+        if expire_after is None or expire_after in harness.calls:
+            return 101.0
+        return 99.0
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        harness.controller(
+            deadline_monotonic=100.0,
+            monotonic=deadline_clock,
+        ).run()
+
+    assert harness.calls == expected_calls
+    assert harness.commands == []
+
+
+@pytest.mark.parametrize(
+    ("artifact", "as_directory"),
+    [
+        ("optimizer.bin", False),
+        ("optimizer.bin", True),
+        ("scheduler.bin", False),
+        ("scheduler.bin", True),
+    ],
+)
+def test_checkpoint_rejects_empty_or_non_regular_accelerate_state(
+    tmp_path: Path, artifact: str, as_directory: bool
+):
+    _publish_checkpoint(tmp_path, 625)
+    target = tmp_path / "checkpoint-625" / artifact
+    target.unlink()
+    if as_directory:
+        target.mkdir()
+    else:
+        target.write_bytes(b"")
+
+    with pytest.raises(FileNotFoundError, match="complete checkpoint"):
+        require_complete_checkpoint(tmp_path / "checkpoint-625", 625)
+
+
+def test_checkpoint_accepts_nonempty_regular_accelerate_state(tmp_path: Path):
+    _publish_checkpoint(tmp_path, 625)
+
+    assert require_complete_checkpoint(
+        tmp_path / "checkpoint-625", 625
+    ) == tmp_path / "checkpoint-625"
+
+
+@pytest.mark.parametrize(
+    ("required", "impostor"),
+    [
+        ("optimizer.bin", "optimizer-not-state.txt"),
+        ("scheduler.bin", "scheduler-not-state.txt"),
+    ],
+)
+def test_checkpoint_rejects_non_accelerate_prefix_impostors(
+    tmp_path: Path, required: str, impostor: str
+):
+    _publish_checkpoint(tmp_path, 625)
+    checkpoint = tmp_path / "checkpoint-625"
+    (checkpoint / required).unlink()
+    (checkpoint / impostor).write_bytes(b"not accelerate state")
+
+    with pytest.raises(FileNotFoundError, match="complete checkpoint"):
+        require_complete_checkpoint(checkpoint, 625)
 
 
 def test_process_death_replays_command_persisted_as_running(tmp_path: Path):
