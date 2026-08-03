@@ -58,3 +58,10 @@
 - Recovery: Continue from branch `feature/omnivoice-lora-finetuning` after the preservation commit following `bb260d5`; do not redo Tasks 1-8 or the initial Task 9 implementation.
 - Changed: Task 9 review fixes now require exact merged coverage from all eight hypothesis ledgers before any rank can report success, validate stored ledger-rank ownership on both transcription and failure persistence, check deadline/SIGTERM before and after GigaAM loading, and synchronize even when a corrupt ledger makes both normal transcription and durable failure persistence reject the row.
 - Validation: Task 9's final focused gate passed 56 tests plus Ruff and `git diff --check`. Two scoped independent re-reviews marked every original and follow-up finding addressed with no new breakage. Task 9 is complete in code; real eight-GPU GigaAM execution remains deferred to Task 12.
+
+## 2026-08-03 - Task 10 scoring and W&B reporting
+
+- Decision: Publish six deterministic local artifacts before initializing W&B, and keep one atomic store for a resumable run ID plus exactly four fixed audio IDs across checkpoints. An online failure returns nonzero without deleting complete local metrics.
+- Changed: Validation scoring now requires exact 2,000-ID coverage for assignments, successful hash-valid synthesis WAVs, shared mono 24 kHz PCM16/nonempty WAV conformance, and successful ASR hypotheses. Reporting reuses Task 6 metric primitives for true reference-character micro CER and exposes overall/category rates, S/D/I/C/N counts, failures, throughput, wall time, optimizer step, fractional epoch, and optional dev loss.
+- Validation: Task 10's final combined Task 9/10 gate passed 71 tests plus Ruff and `git diff --check`. Two fix rounds and scoped re-reviews closed the failed/invalid synthesis artifact paths with no remaining findings.
+- Follow-up: The local environment does not yet contain the optional W&B package, so real online authentication, initialization, four-audio upload, and dashboard inspection remain for Tasks 11-12. Task 11 must pass measured synthesis/ASR durations so throughput is meaningful rather than zero.
