@@ -27,6 +27,7 @@ import math
 import os
 import sys
 import time
+from dataclasses import asdict, is_dataclass
 from datetime import timedelta
 from typing import Any, Optional
 
@@ -34,6 +35,7 @@ import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import DeepSpeedPlugin, InitProcessGroupKwargs, set_seed
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import (
     get_cosine_schedule_with_warmup,
     get_constant_schedule_with_warmup,
@@ -100,6 +102,23 @@ class OmniTrainer:
         self.global_step = 0
         self.epoch = 0
 
+    def _epoch_sample_total(self) -> Optional[int]:
+        """Return the global source-sample count when the dataset exposes it."""
+        dataset = getattr(self.train_dataloader, "dataset", None)
+        raw_dataset = getattr(dataset, "dataset", None)
+        sample_count = getattr(raw_dataset, "num_items", None)
+        return sample_count if isinstance(sample_count, int) and sample_count > 0 else None
+
+    def _batch_sample_count(self, batch: dict[str, Any]) -> int:
+        """Count original samples represented by one collated local batch."""
+        document_ids = batch.get("document_ids")
+        if isinstance(document_ids, torch.Tensor):
+            maximum = int(document_ids.max().item())
+            return maximum + 1 if maximum >= 0 else 0
+        input_ids = batch.get("input_ids")
+        # The non-packed path has one sample per batch row.
+        return int(input_ids.shape[0]) if isinstance(input_ids, torch.Tensor) else 0
+
     def _init_accelerator(self) -> Accelerator:
         """Initialize Accelerator, DeepSpeed, and Logging."""
         # TF32 setup
@@ -123,10 +142,14 @@ class OmniTrainer:
                 gradient_clipping=self.config.max_grad_norm,
             )
 
+        log_with = ["tensorboard"]
+        if getattr(self.config, "wandb_project", None):
+            log_with.append("wandb")
+
         accelerator = Accelerator(
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             mixed_precision=self.config.mixed_precision,
-            log_with="tensorboard",
+            log_with=log_with,
             project_dir=self.config.output_dir,
             step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs, init_kwargs],
@@ -159,7 +182,22 @@ class OmniTrainer:
 
         logger.info(f"Loaded Config: {self.config}")
         set_seed(self.config.seed)
-        accelerator.init_trackers("tensorboard")
+        tracker_config = (
+            asdict(self.config) if is_dataclass(self.config) else vars(self.config)
+        )
+        if getattr(self.config, "wandb_project", None):
+            wandb_kwargs = {"mode": self.config.wandb_mode}
+            if self.config.wandb_entity:
+                wandb_kwargs["entity"] = self.config.wandb_entity
+            if self.config.wandb_run_name:
+                wandb_kwargs["name"] = self.config.wandb_run_name
+            accelerator.init_trackers(
+                self.config.wandb_project,
+                config=tracker_config,
+                init_kwargs={"wandb": wandb_kwargs},
+            )
+        else:
+            accelerator.init_trackers("tensorboard", config=tracker_config)
         return accelerator
 
     def create_optimizer_and_scheduler(self):
@@ -221,12 +259,27 @@ class OmniTrainer:
         local_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
         eval_count = 0
 
+        try:
+            eval_total = len(self.eval_dataloader)
+        except TypeError:
+            eval_total = None
+
+        eval_iterator = tqdm(
+            self.eval_dataloader,
+            total=eval_total,
+            desc="Validation",
+            dynamic_ncols=True,
+            disable=not self.accelerator.is_local_main_process,
+            leave=False,
+        )
         with torch.no_grad():
-            for eval_batch in self.eval_dataloader:
+            for eval_batch in eval_iterator:
                 eval_batch = _to_device(eval_batch, self.accelerator.device)
                 outputs = self.model(**eval_batch)
                 local_loss_sum += outputs.loss.detach()
                 eval_count += 1
+
+        eval_iterator.close()
 
         if eval_count > 0:
             local_mean = local_loss_sum / eval_count
@@ -261,6 +314,11 @@ class OmniTrainer:
             self.accelerator, self.config.steps, self.config.logging_steps
         )
         train_logger.start(self.global_step)
+        try:
+            epoch_total = len(self.train_dataloader)
+        except TypeError:
+            epoch_total = None
+        train_logger.start_epoch(self.epoch, epoch_total)
 
         self.model.train()
         train_iterator = iter(self.train_dataloader)
@@ -270,16 +328,59 @@ class OmniTrainer:
         tr_loss = torch.tensor(0.0).to(self.accelerator.device)
         logging_loss_scalar = 0.0
 
+        epoch_step = 0
+        epoch_samples = 0
+        evals_this_epoch = 0
+        epoch_sample_total = self._epoch_sample_total()
+        sample_eval_targets = []
+        if getattr(self.config, "evals_per_epoch", 0) > 0 and epoch_sample_total:
+            sample_eval_targets = [
+                math.ceil(epoch_sample_total * index / self.config.evals_per_epoch)
+                for index in range(1, self.config.evals_per_epoch + 1)
+            ]
+        epoch_eval_interval = 0
+        if (
+            getattr(self.config, "evals_per_epoch", 0) > 0
+            and not sample_eval_targets
+            and getattr(self.config, "estimated_steps_per_epoch", 0) > 0
+        ):
+            epoch_eval_interval = max(
+                1,
+                math.ceil(
+                    self.config.estimated_steps_per_epoch
+                    / self.config.evals_per_epoch
+                ),
+            )
+
         while self.global_step < self.config.steps:
             try:
                 batch = next(train_iterator)
             except StopIteration:
+                # Make sure the end of every completed epoch receives a full
+                # validation pass when using an epoch-relative schedule.
+                if (
+                    self.eval_dataloader is not None
+                    and getattr(self.config, "evals_per_epoch", 0) > 0
+                    and evals_this_epoch < self.config.evals_per_epoch
+                ):
+                    self.evaluate()
+                train_logger.close_epoch()
                 self.epoch += 1
+                if (
+                    getattr(self.config, "max_epochs", None) is not None
+                    and self.epoch >= self.config.max_epochs
+                ):
+                    logger.info("Reached configured max_epochs=%s", self.config.max_epochs)
+                    break
                 logger.info(f"Epoch {self.epoch} starting. Resetting dataloader...")
                 if hasattr(self.train_dataloader.dataset, "set_epoch"):
                     self.train_dataloader.dataset.set_epoch(self.epoch)
 
                 train_iterator = iter(self.train_dataloader)
+                train_logger.start_epoch(self.epoch, epoch_total)
+                epoch_step = 0
+                epoch_samples = 0
+                evals_this_epoch = 0
                 batch = next(train_iterator)
 
             batch = _to_device(batch, self.accelerator.device)
@@ -303,6 +404,13 @@ class OmniTrainer:
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
                     self.global_step += 1
+                    epoch_step += 1
+                    local_samples = self._batch_sample_count(batch)
+                    global_samples = self.accelerator.reduce(
+                        torch.tensor(local_samples, device=self.accelerator.device),
+                        reduction="sum",
+                    )
+                    epoch_samples += int(global_samples.item())
 
                     # Logging
                     current_lr = self.lr_scheduler.get_last_lr()[0]
@@ -339,14 +447,42 @@ class OmniTrainer:
                         logging_start_step = self.global_step
 
                     # Evaluate
-                    if (
-                        self.eval_dataloader is not None
+                    scheduled_global_eval = (
+                        self.config.eval_steps > 0
                         and self.global_step % self.config.eval_steps == 0
-                    ):
+                    )
+                    scheduled_epoch_eval = (
+                        evals_this_epoch < getattr(self.config, "evals_per_epoch", 0)
+                        and (
+                            (
+                                bool(sample_eval_targets)
+                                and epoch_samples
+                                >= sample_eval_targets[evals_this_epoch]
+                            )
+                            or (
+                                epoch_eval_interval > 0
+                                and epoch_step
+                                >= (evals_this_epoch + 1) * epoch_eval_interval
+                            )
+                        )
+                    )
+                    did_evaluate = self.eval_dataloader is not None and (
+                        scheduled_global_eval or scheduled_epoch_eval
+                    )
+                    if did_evaluate:
                         self.evaluate()
+                        if scheduled_epoch_eval:
+                            evals_this_epoch += 1
 
                     # Save
-                    if self.global_step % self.config.save_steps == 0:
+                    if did_evaluate and getattr(
+                        self.config, "save_on_evaluation", False
+                    ):
+                        self.save_checkpoint(self.global_step)
+                    elif (
+                        self.config.save_steps > 0
+                        and self.global_step % self.config.save_steps == 0
+                    ):
                         self.save_checkpoint(self.global_step)
 
         # Final Save

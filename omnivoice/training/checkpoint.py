@@ -50,6 +50,7 @@ class TrainLogger:
         self.logging_steps = logging_steps
         self.start_time = None
         self.progress_bar = None
+        self.epoch_progress_bar = None
 
     def start(self, start_step: int = 0):
         self.start_time = time.time()
@@ -69,7 +70,7 @@ class TrainLogger:
         """
         Called every step to update the progress bar UI.
         """
-        if self.progress_bar:
+        if self.progress_bar is not None:
             self.progress_bar.update(1)
 
             # Update real-time metrics on the progress bar itself
@@ -81,6 +82,29 @@ class TrainLogger:
 
             if postfix:
                 self.progress_bar.set_postfix(postfix)
+
+        if self.epoch_progress_bar is not None:
+            self.epoch_progress_bar.update(1)
+
+    def start_epoch(self, epoch: int, total_steps: Optional[int] = None):
+        """Start the progress bar for the current pass through the dataloader."""
+        if self.epoch_progress_bar is not None:
+            self.epoch_progress_bar.close()
+
+        if self.accelerator.is_main_process:
+            self.epoch_progress_bar = tqdm(
+                total=total_steps,
+                desc=f"Epoch {epoch + 1}",
+                dynamic_ncols=True,
+                disable=not self.accelerator.is_local_main_process,
+                leave=False,
+            )
+
+    def close_epoch(self):
+        """Close the current epoch progress bar, if one is active."""
+        if self.epoch_progress_bar is not None:
+            self.epoch_progress_bar.close()
+            self.epoch_progress_bar = None
 
     def log_metrics(self, step: int, metrics: Dict[str, Any]):
         """
@@ -105,13 +129,14 @@ class TrainLogger:
 
             # Use external logger to write to file, tqdm.write to avoid breaking bar
             msg = f"Step {step} | " + " | ".join(formatted_metrics)
-            if self.progress_bar:
+            if self.progress_bar is not None:
                 self.progress_bar.write(msg)
             else:
                 logger.info(msg)
 
     def close(self):
-        if self.progress_bar:
+        self.close_epoch()
+        if self.progress_bar is not None:
             self.progress_bar.close()
 
 

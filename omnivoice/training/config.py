@@ -65,11 +65,20 @@ class TrainingConfig:
     warmup_type: str = "ratio"
     warmup_ratio: float = 0.03
     warmup_steps: int = 2000
+    # When set, stop after this many fully consumed data epochs. ``steps`` still
+    # defines the scheduler horizon and remains the fallback stop condition.
+    max_epochs: Optional[int] = None
+    # Optional epoch-relative validation schedule. A positive value runs this
+    # many full validation passes per epoch, positioned by globally consumed
+    # samples (therefore independent of variable packed-batch sizes).
+    evals_per_epoch: int = 0
+    estimated_steps_per_epoch: int = 0
 
     # Data
     batch_tokens: int = 8192
     gradient_accumulation_steps: int = 1
     num_workers: int = 8
+    pin_memory: bool = True
 
     # System
     mixed_precision: str = "bf16"
@@ -87,7 +96,15 @@ class TrainingConfig:
     logging_steps: int = 100
     eval_steps: int = 1000
     save_steps: int = 10000
+    save_on_evaluation: bool = False
     keep_last_n_checkpoints: int = -1
+
+    # Optional Weights & Biases tracker. Leaving ``wandb_project`` unset keeps
+    # the historic TensorBoard-only behavior.
+    wandb_project: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_mode: str = "online"
 
     @classmethod
     def from_json(cls, json_path: str):

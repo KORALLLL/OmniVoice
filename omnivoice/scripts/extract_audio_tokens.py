@@ -50,6 +50,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import sqlite3
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
@@ -62,7 +63,11 @@ from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import tqdm
 from transformers import AutoFeatureExtractor, HiggsAudioV2TokenizerModel
 
-from omnivoice.data.dataset import JsonlDatasetReader, WebDatasetReader
+from omnivoice.data.dataset import (
+    JsonlDatasetReader,
+    WebDatasetReader,
+    load_audio_webdataset,
+)
 from omnivoice.utils.common import str2bool
 
 warnings.filterwarnings(
@@ -77,6 +82,36 @@ worker_tokenizer = None
 worker_feature_extractor = None
 
 
+class RawWebDatasetReader(IterableDataset):
+    """Read audio and embedded JSON labels from raw WebDataset tar shards."""
+
+    def __init__(self, urls: list[str]):
+        self.urls = urls
+
+    def __iter__(self):
+        dataset = wds.WebDataset(
+            self.urls,
+            shardshuffle=False,
+            workersplitter=wds.split_by_worker,
+            nodesplitter=wds.split_by_node,
+        ).decode()
+        for sample in dataset:
+            audio_bytes = sample.get("mp3")
+            metadata = sample.get("json")
+            if audio_bytes is None or metadata is None:
+                continue
+            if not isinstance(metadata, dict):
+                metadata = json.loads(metadata)
+
+            audio = load_audio_webdataset(audio_bytes, HIGGS_INPUT_SAMPLE_RATE)
+            audio = (audio / (audio.abs().max() + 1e-7)) * 0.9
+            yield {
+                "audio": audio,
+                "audio_duration": audio.size(-1) / HIGGS_INPUT_SAMPLE_RATE,
+                "label": metadata,
+            }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -88,6 +123,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--input_jsonl",
         default=None,
         help="Path to raw JSONL file (alternative to --input_manifest).",
+    )
+    parser.add_argument(
+        "--input_raw_webdataset_manifest",
+        default=None,
+        help=(
+            "Manifest of raw WebDataset tar shards with embedded JSON labels. "
+            "Each line must be '<tar_path> <sample_count>'."
+        ),
     )
     parser.add_argument(
         "--tar_output_pattern",
@@ -153,10 +196,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of worker processes to spawn per GPU.",
     )
     parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Waveforms encoded together by each GPU worker (default: 1).",
+    )
+    parser.add_argument(
         "--loader_workers",
         type=int,
         default=24,
         help="Number of DataLoader workers for streaming IterableDataset.",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Optional cap on selected samples; intended for smoke tests.",
     )
     parser.add_argument(
         "--shuffle",
@@ -169,6 +224,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=42,
         help="Random seed for shuffle (default: 42).",
+    )
+    parser.add_argument(
+        "--metadata_db",
+        default=None,
+        help=(
+            "Optional SQLite database with a samples table containing "
+            "source_relative_path, text, and agreement columns. When provided, "
+            "metadata is joined onto WebDataset samples before tokenization."
+        ),
+    )
+    parser.add_argument(
+        "--agreement_split",
+        choices=("lt", "ge"),
+        default=None,
+        help="Select metadata rows below (lt) or at/above (ge) --agreement_threshold.",
+    )
+    parser.add_argument(
+        "--agreement_threshold",
+        type=float,
+        default=0.95,
+        help="Agreement threshold used with --agreement_split (default: 0.95).",
     )
     return parser
 
@@ -215,54 +291,72 @@ def process_init(rank_queue, tokenizer_path):
     logging.debug(f"Tokenizer loaded successfully on device {worker_device}")
 
 
-def process_single_sample(sample: dict[str, Any]) -> dict[str, Any]:
+def process_sample_batch(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Single-sample processing function executed in worker processes.
-    Skips invalid samples during streaming processing.
+    Batched processing function executed in worker processes.
+
+    Feature extraction pads the batch to its longest waveform.  The tokenizer does
+    not take an attention mask, so each returned code sequence is trimmed back to
+    the exact convolutional output length for its unpadded waveform.
     """
     try:
-        audio_tensor = sample.get("audio", None)  # shape (1, T)
-        if audio_tensor is None:
-            raise ValueError("Sample missing 'audio' field")
-
         with torch.inference_mode():
-            key = sample["label"]["id"]
+            audio_tensors = []
+            for sample in samples:
+                audio_tensor = sample.get("audio", None)  # shape (1, T)
+                if audio_tensor is None:
+                    raise ValueError("Sample missing 'audio' field")
+                audio_tensors.append(audio_tensor)
+
             inputs = worker_feature_extractor(
-                raw_audio=audio_tensor.squeeze(0).numpy(),
+                raw_audio=[audio.squeeze(0).numpy() for audio in audio_tensors],
                 sampling_rate=HIGGS_INPUT_SAMPLE_RATE,
                 return_tensors="pt",
+                padding=True,
             ).to(worker_tokenizer.device)
-            audio_tokens = worker_tokenizer.encode(
-                inputs["input_values"],
-            ).audio_codes.squeeze(0)
+            encoded = worker_tokenizer.encode(inputs["input_values"])
+            batch_codes = encoded.audio_codes
 
-            assert len(audio_tokens.shape) == 2
-            assert audio_tokens.size(0) == 8
+            results = []
+            for sample, audio_tensor, audio_tokens in zip(
+                samples, audio_tensors, batch_codes, strict=True
+            ):
+                # The acoustic encoder determines the sequence length.  This is
+                # exactly the length the unpadded single-item call would emit.
+                num_tokens = int(
+                    worker_tokenizer._get_conv1d_output_lengths(
+                        audio_tensor.shape[-1], worker_tokenizer.acoustic_encoder
+                    )
+                )
+                audio_tokens = audio_tokens[:, :num_tokens]
+                assert len(audio_tokens.shape) == 2
+                assert audio_tokens.size(0) == 8
 
-            num_tokens = audio_tokens.size(1)
-            metadata = sample["label"]
-            metadata["num_tokens"] = num_tokens
-
-            # Convert to numpy format for subsequent serialization (int16 to save space)
-            audio_tokens_np = audio_tokens.to(torch.int16).cpu().numpy()
-
-            return {
-                "status": "success",
-                "key": key,
-                "audio_tokens": audio_tokens_np,
-                "metadata": metadata,
-                "error_msg": None,
-            }
+                metadata = sample["label"]
+                metadata["num_tokens"] = num_tokens
+                results.append(
+                    {
+                        "status": "success",
+                        "key": metadata["id"],
+                        "audio_tokens": audio_tokens.to(torch.int16).cpu().numpy(),
+                        "metadata": metadata,
+                        "error_msg": None,
+                    }
+                )
+            return results
     except Exception as e:
-        sample_id = sample.get("label", {}).get("id", "unknown")
-        logging.error(f"Failed to process sample {sample_id}: {e}")
-        return {
-            "status": "error",
-            "key": sample_id,
-            "audio_tokens": None,
-            "metadata": None,
-            "error_msg": str(e),
-        }
+        sample_ids = [sample.get("label", {}).get("id", "unknown") for sample in samples]
+        logging.error(f"Failed to process batch {sample_ids[:3]}: {e}")
+        return [
+            {
+                "status": "error",
+                "key": sample_id,
+                "audio_tokens": None,
+                "metadata": None,
+                "error_msg": str(e),
+            }
+            for sample_id in sample_ids
+        ]
 
 
 def _normalise_value(value: Any) -> Any:
@@ -327,14 +421,25 @@ def main() -> None:
     mp.set_start_method("spawn", force=True)
 
     # Validate input arguments
-    assert bool(args.input_manifest) != bool(args.input_jsonl), (
-        "Exactly one of --input_manifest or --input_jsonl must be provided."
+    input_modes = [
+        bool(args.input_manifest),
+        bool(args.input_jsonl),
+        bool(args.input_raw_webdataset_manifest),
+    ]
+    assert sum(input_modes) == 1, (
+        "Exactly one input mode must be provided: --input_manifest, "
+        "--input_jsonl, or --input_raw_webdataset_manifest."
     )
 
     if args.num_machines > 1:
         assert 0 <= args.machine_index < args.num_machines, (
             f"machine_index {args.machine_index} must be in [0, {args.num_machines})"
         )
+
+    if args.agreement_split and not args.metadata_db:
+        parser.error("--agreement_split requires --metadata_db")
+    if args.metadata_db and args.input_jsonl:
+        parser.error("--metadata_db requires a WebDataset input mode")
 
     # Build base dataset and count total samples based on input mode
     if args.input_jsonl:
@@ -347,7 +452,7 @@ def main() -> None:
             shuffle_seed=args.shuffle_seed,
         )
         loader_workers = args.loader_workers
-    else:
+    elif args.input_manifest:
         logging.info(f"Input mode: WebDataset manifest ({args.input_manifest})")
         manifest_num_lines = count_lines(args.input_manifest)
         loader_workers = min(args.loader_workers, manifest_num_lines)
@@ -387,6 +492,59 @@ def main() -> None:
             sample_rate=HIGGS_INPUT_SAMPLE_RATE,
             evaluation=True,
         )
+    else:
+        urls = []
+        total_samples = 0
+        with open(args.input_raw_webdataset_manifest, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                if len(parts) != 2:
+                    raise ValueError(
+                        "Raw WebDataset manifest lines must contain "
+                        "'<tar_path> <sample_count>'."
+                    )
+                tar_path, sample_count = parts[0], int(parts[1])
+                if not os.path.isfile(tar_path):
+                    raise FileNotFoundError(f"Raw WebDataset tar not found: {tar_path}")
+                urls.append(tar_path)
+                total_samples += sample_count
+        logging.info(
+            "Input mode: raw WebDataset manifest (%s shards, %s samples)",
+            len(urls),
+            total_samples,
+        )
+        base_dataset = RawWebDatasetReader(urls)
+        loader_workers = args.loader_workers
+
+    metadata_connection = None
+    metadata_cursor = None
+    if args.metadata_db:
+        metadata_path = os.path.abspath(args.metadata_db)
+        if not os.path.isfile(metadata_path):
+            raise FileNotFoundError(f"Metadata database not found: {metadata_path}")
+        metadata_connection = sqlite3.connect(
+            f"file:{metadata_path}?mode=ro", uri=True
+        )
+        metadata_cursor = metadata_connection.cursor()
+        if args.agreement_split:
+            comparator = "<" if args.agreement_split == "lt" else ">="
+            selected_total = metadata_cursor.execute(
+                f"SELECT COUNT(*) FROM samples WHERE agreement {comparator} ?",
+                (args.agreement_threshold,),
+            ).fetchone()[0]
+            logging.info(
+                "Selecting %s metadata rows with agreement %s %.6f",
+                selected_total,
+                comparator,
+                args.agreement_threshold,
+            )
+        else:
+            selected_total = metadata_cursor.execute(
+                "SELECT COUNT(*) FROM samples"
+            ).fetchone()[0]
+            logging.info("Joining metadata for %s rows", selected_total)
 
     # Adjust samples_per_shard if min_num_shards would be violated
     samples_per_shard = args.samples_per_shard
@@ -537,7 +695,8 @@ def main() -> None:
                 f"Skipping failed sample {result['key']}: {result['error_msg']}"
             )
 
-    main_progress = tqdm(total=total_samples, desc="Extracting Audio Tokens")
+    progress_total = selected_total if metadata_cursor else total_samples
+    main_progress = tqdm(total=progress_total, desc="Extracting Audio Tokens")
 
     try:
         with ProcessPoolExecutor(
@@ -555,21 +714,76 @@ def main() -> None:
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for f in done:
                     futures.discard(f)
-                    result = f.result()
-                    main_progress.update(1)
-                    handle_result(result)
-                    main_progress.set_postfix(
-                        Samples=processed_count,
-                        Errors=error_count,
-                    )
+                    for result in f.result():
+                        main_progress.update(1)
+                        handle_result(result)
+                        main_progress.set_postfix(
+                            Samples=processed_count,
+                            Errors=error_count,
+                        )
+
+            batch = []
+
+            def submit_batch():
+                nonlocal batch
+                if not batch:
+                    return
+                if len(futures) >= max_pending:
+                    drain_completed()
+                futures.add(executor.submit(process_sample_batch, batch))
+                batch = []
+
+            submitted_count = 0
 
             # Stream samples from DataLoader
             for sample in dataloader:
-                if len(futures) >= max_pending:
-                    drain_completed()
+                if metadata_cursor:
+                    source_relative_path = sample["label"].get(
+                        "source_relative_path"
+                    )
+                    if not source_relative_path:
+                        raise ValueError("Input metadata is missing source_relative_path")
 
-                future = executor.submit(process_single_sample, sample)
-                futures.add(future)
+                    row = metadata_cursor.execute(
+                        "SELECT text, agreement FROM samples "
+                        "WHERE source_relative_path = ?",
+                        (source_relative_path,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+
+                    text, agreement = row
+                    if args.agreement_split == "lt" and not (
+                        agreement < args.agreement_threshold
+                    ):
+                        continue
+                    if args.agreement_split == "ge" and not (
+                        agreement >= args.agreement_threshold
+                    ):
+                        continue
+
+                    metadata = sample["label"].copy()
+                    metadata.update(
+                        {
+                            "id": source_relative_path.rsplit(".", 1)[0].replace(
+                                "/", "__"
+                            ),
+                            "text": text,
+                            "language_id": "ru",
+                            "asr_agreement_mean": agreement,
+                            "agreement_bucket": args.agreement_split,
+                        }
+                    )
+                    sample["label"] = metadata
+
+                batch.append(sample)
+                submitted_count += 1
+                if len(batch) >= args.batch_size:
+                    submit_batch()
+                if args.max_samples is not None and submitted_count >= args.max_samples:
+                    break
+
+            submit_batch()
 
             # Process remaining futures
             logging.info("Processing remaining pending samples...")
@@ -580,6 +794,8 @@ def main() -> None:
         logging.error("Critical error during processing", exc_info=True)
         raise
     finally:
+        if metadata_connection is not None:
+            metadata_connection.close()
         main_progress.close()
         if tar_writer is not None:
             tar_writer.close()

@@ -199,7 +199,7 @@ def build_dataloaders(
         num_workers=config.num_workers,
         collate_fn=collate_fn,
         worker_init_fn=init_fn,
-        pin_memory=True,
+        pin_memory=config.pin_memory,
         prefetch_factor=4,
     )
 
@@ -225,7 +225,7 @@ def build_dataloaders(
             batch_size=None,  # Each item is already a collated batch
             num_workers=1,
             collate_fn=collate_fn,
-            pin_memory=True,
+            pin_memory=config.pin_memory,
             prefetch_factor=2,
         )
 
