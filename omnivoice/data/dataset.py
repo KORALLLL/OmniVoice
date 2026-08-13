@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import random
+import re
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
@@ -308,10 +309,24 @@ class WebDatasetReader(IterableDataReader):
         evaluation: bool = False,
         shuffle_buffer_size: int = 20000,
         sample_rate: int = 24000,
+        label_text_regex: Optional[str] = None,
+        label_text_keep_ratio: float = 0.0,
     ):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.evaluation = evaluation
         self.epoch = 0
+        self.label_text_regex = (
+            re.compile(label_text_regex, flags=re.IGNORECASE)
+            if label_text_regex
+            else None
+        )
+        # Probability of keeping a sample that does NOT match label_text_regex.
+        # 0.0 reproduces the historic hard filter (matching samples only), which
+        # puts 100% of the gradient on number-bearing text and measurably trades
+        # whole-utterance quality away for digit-span accuracy. A value in
+        # (0, 1] retains a share of general speech so both objectives get
+        # gradient; 1.0 disables filtering entirely.
+        self.label_text_keep_ratio = float(label_text_keep_ratio)
 
         self.orig_urls = []
         self.tar_to_label = {}
@@ -349,6 +364,23 @@ class WebDatasetReader(IterableDataReader):
         pipeline = dataset.decode().map(self.sample_decoder)
         if not self.evaluation:
             pipeline = pipeline.shuffle(self.shuffle_buffer_size, seed=self.epoch)
+        if self.label_text_regex is not None and self.label_text_keep_ratio < 1.0:
+            keep_ratio = self.label_text_keep_ratio
+            # Rank/worker-independent: webdataset already shards upstream, and
+            # the decision is per-sample, so a plain RNG keeps the expected mix
+            # identical on every rank without needing cross-rank coordination.
+            rng = random.Random(1234567 + self.epoch)
+
+            def _keep(sample):
+                if self.label_text_regex.search(
+                    # Stress marks are part of the required supervision but
+                    # are not lexical characters for a text filter.
+                    sample["label"].get("text", "").replace("+", "")
+                ):
+                    return True
+                return keep_ratio > 0.0 and rng.random() < keep_ratio
+
+            pipeline = pipeline.select(_keep)
         return iter(pipeline)
 
     def __len__(self) -> int:

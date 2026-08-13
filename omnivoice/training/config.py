@@ -53,7 +53,27 @@ class TrainingConfig:
 
     # Init settings
     resume_from_checkpoint: Optional[str] = None
+    resume_weights_only: bool = False
+    resume_step: int = 0
     init_from_checkpoint: Optional[str] = None
+
+    lora_rank: int = 0
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: List[str] = field(default_factory=lambda: [
+        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"
+    ])
+    lora_train_audio_modules: bool = False
+    # Keep parameter-efficient adapters as the default, but allow a small
+    # trainable suffix of the transformer when the task needs more acoustic
+    # adaptation capacity than low-rank updates alone can provide.
+    lora_train_last_n_layers: int = 0
+
+    # A full generative validation intentionally keeps non-main DDP ranks at
+    # a synchronization barrier while rank zero generates and transcribes the
+    # benchmark.  Its duration can exceed PyTorch's one-hour default, so make
+    # that watchdog bound explicit and configurable.
+    distributed_timeout_minutes: int = 480
 
     # Training Hyperparams
     learning_rate: float = 1e-4
@@ -91,20 +111,56 @@ class TrainingConfig:
     max_sample_tokens: int = 2000
     min_sample_tokens: int = 50
     max_batch_size: int = 64
+    # Optional targeted-supervision filter.  It matches the tokenization's
+    # selected label["text"] field and never changes audio/text pairings.
+    train_label_text_regex: Optional[str] = None
+    # Probability of keeping a sample that does NOT match train_label_text_regex.
+    # 0.0 = historic hard filter (only matching samples train). That puts all
+    # gradient on number-bearing text and trades whole-utterance quality for
+    # digit-span accuracy. Use a value in (0, 1] to blend general speech back in
+    # so both metrics can improve together; 1.0 disables filtering.
+    train_label_text_keep_ratio: float = 0.0
+    # Number of source samples in one effective training epoch.  This is used
+    # for epoch-relative validation when a stream filter changes the manifest
+    # count without materializing a second dataset.
+    train_epoch_sample_count: Optional[int] = None
 
     # Logging
     logging_steps: int = 100
     eval_steps: int = 1000
     save_steps: int = 10000
     save_on_evaluation: bool = False
+    deterministic_eval: bool = True
+    save_before_evaluation: bool = False
+    save_final_checkpoint: bool = True
     keep_last_n_checkpoints: int = -1
 
-    # Optional Weights & Biases tracker. Leaving ``wandb_project`` unset keeps
-    # the historic TensorBoard-only behavior.
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
     wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
+
+    hard_number_eval_enabled: bool = False
+    hard_number_eval_dataset_path: Optional[str] = None
+    hard_number_eval_seed: int = 42
+    hard_number_eval_model_name: str = "v3_e2e_rnnt"
+    hard_number_eval_voice_count: int = 40
+    hard_number_eval_voice_manifest_path: Optional[str] = None
+    # JSON list of speaker keys that must never be used as hard-eval references.
+    # This makes a shard-based dev split genuinely speaker held out.
+    hard_number_eval_excluded_speaker_keys_path: Optional[str] = None
+    hard_number_eval_batch_size: int = 2
+    # Cap on scored (text, voice) pairs for *periodic* in-training validation.
+    # 0 keeps the full sweep.  The full sweep is ~2,000 pairs and costs 40-80
+    # minutes, during which rank 0 owns the GPUs and every other rank spins in
+    # an NCCL barrier; running that four times per epoch dominates wall clock
+    # and is the window in which the collective deadlock was observed.  A few
+    # hundred pairs tracks the trend well enough to steer a run; score the full
+    # set once at the end.
+    hard_number_eval_max_pairs: int = 0
+    # Periodic evaluation samples this many texts per voice.  The historic
+    # hard-coded value was 50 (50 x 40 voices = the 2,000-pair full sweep).
+    hard_number_eval_samples_per_voice: int = 50
 
     @classmethod
     def from_json(cls, json_path: str):

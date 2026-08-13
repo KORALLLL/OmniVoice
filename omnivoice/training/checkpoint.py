@@ -26,6 +26,7 @@ Key components:
 - ``load_checkpoint()``: Restores training state from a checkpoint directory.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -34,9 +35,85 @@ from typing import Any, Dict, Optional
 
 import torch
 from accelerate import Accelerator
+from safetensors.torch import load_file as load_safetensors, save_file as save_safetensors
 from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
+
+LORA_AUDIO_MODULES_FILENAME = "omnivoice_audio_modules.safetensors"
+LORA_TRAINABLE_MODULES_FILENAME = "omnivoice_trainable_non_lora.safetensors"
+
+
+def save_lora_audio_modules(model, adapter_dir, *, base_omnivoice_checkpoint):
+    os.makedirs(adapter_dir, exist_ok=True)
+    state = {
+        f"{name}.{key}": value.detach().cpu().contiguous()
+        for name in ("audio_embeddings", "audio_heads")
+        for key, value in getattr(model, name).state_dict().items()
+    }
+    save_safetensors(state, os.path.join(adapter_dir, LORA_AUDIO_MODULES_FILENAME))
+    with open(os.path.join(adapter_dir, "omnivoice_lora.json"), "w") as handle:
+        json.dump({"format_version": 1, "base_omnivoice_checkpoint": base_omnivoice_checkpoint,
+                   "audio_module_state": LORA_AUDIO_MODULES_FILENAME,
+                   "audio_modules": ["audio_embeddings", "audio_heads"]}, handle)
+
+
+def load_lora_audio_modules(model, adapter_dir):
+    path = os.path.join(adapter_dir, LORA_AUDIO_MODULES_FILENAME)
+    if not os.path.isfile(path):
+        return False
+    state = load_safetensors(path, device="cpu")
+    for name in ("audio_embeddings", "audio_heads"):
+        prefix = name + "."
+        getattr(model, name).load_state_dict({k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)})
+    return True
+
+
+def save_lora_trainable_modules(model, adapter_dir):
+    """Persist non-adapter trainables in a lightweight LoRA checkpoint.
+
+    Audio embeddings/heads have their own stable sidecar.  This captures an
+    optional unfrozen transformer suffix so a checkpoint is an exact inference
+    artifact rather than silently reverting those layers to the base model.
+    """
+    state = {
+        name: parameter.detach().cpu().contiguous()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+        and "lora_" not in name
+        and not name.startswith("audio_embeddings.")
+        and not name.startswith("audio_heads.")
+    }
+    if not state:
+        return False
+    path = os.path.join(adapter_dir, LORA_TRAINABLE_MODULES_FILENAME)
+    save_safetensors(state, path)
+    metadata_path = os.path.join(adapter_dir, "omnivoice_lora.json")
+    with open(metadata_path) as handle:
+        metadata = json.load(handle)
+    metadata["trainable_non_lora_state"] = LORA_TRAINABLE_MODULES_FILENAME
+    metadata["trainable_non_lora_parameters"] = int(sum(value.numel() for value in state.values()))
+    with open(metadata_path, "w") as handle:
+        json.dump(metadata, handle)
+    return True
+
+
+def load_lora_trainable_modules(model, adapter_dir):
+    path = os.path.join(adapter_dir, LORA_TRAINABLE_MODULES_FILENAME)
+    if not os.path.isfile(path):
+        return False
+    state = load_safetensors(path, device="cpu")
+    named_parameters = dict(model.named_parameters())
+    missing = sorted(set(state) - set(named_parameters))
+    if missing:
+        raise RuntimeError(
+            "Lightweight LoRA checkpoint has trainable tensors absent from the current model: "
+            + ", ".join(missing[:3])
+        )
+    with torch.no_grad():
+        for name, value in state.items():
+            named_parameters[name].copy_(value.to(dtype=named_parameters[name].dtype))
+    return True
 
 
 class TrainLogger:
@@ -154,20 +231,26 @@ def save_checkpoint(
     """
     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
 
-    # 1. Save Accelerator State (Optimizer, Scheduler, RNG, Scaler)
-    accelerator.save_state(checkpoint_dir)
+    # A LoRA adapter plus the audio-module sidecar is a complete inference
+    # checkpoint when paired with the immutable base model.  Saving
+    # Accelerate's model state as well writes another multi-gigabyte copy of
+    # that base model at every validation checkpoint and exhausts local disk
+    # during a normal 4-epoch run.  Preserve exact engine state for full-model
+    # fine-tuning; keep LoRA checkpoints lightweight and portable.
+    unwrapped_model = accelerator.unwrap_model(model)
+    is_lora_checkpoint = hasattr(getattr(unwrapped_model, "llm", None), "peft_config")
+    if is_lora_checkpoint:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    else:
+        accelerator.save_state(checkpoint_dir)
+    accelerator.wait_for_everyone()
 
-    # 2. Save Model in HF format (config.json + pytorch_model.bin/safetensors)
-    unwrap_model = accelerator.unwrap_model(model)
-    unwrap_model.save_pretrained(
-        checkpoint_dir,
-        is_main_process=accelerator.is_main_process,
-        save_function=accelerator.save,
-    )
-
-    # 3. Save Tokenizer
+    # The adapter sidecar is exported by OmniTrainer after this engine-level
+    # checkpoint setup.  Save tokenizer metadata here for both checkpoint
+    # formats.
     if accelerator.is_main_process:
         tokenizer.save_pretrained(checkpoint_dir)
+    accelerator.wait_for_everyone()
 
     logger.info(f"Saved checkpoint to {checkpoint_dir}")
 

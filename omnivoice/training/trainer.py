@@ -25,6 +25,9 @@ Launched via ``omnivoice.cli.train``.
 import logging
 import math
 import os
+import json
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import asdict, is_dataclass
@@ -41,7 +44,12 @@ from transformers import (
     get_constant_schedule_with_warmup,
 )
 
-from omnivoice.training.checkpoint import TrainLogger, load_checkpoint
+from omnivoice.training.checkpoint import (
+    TrainLogger,
+    load_checkpoint,
+    save_lora_audio_modules,
+    save_lora_trainable_modules,
+)
 from omnivoice.training.checkpoint import save_checkpoint as engine_save_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -119,6 +127,72 @@ class OmniTrainer:
         # The non-packed path has one sample per batch row.
         return int(input_ids.shape[0]) if isinstance(input_ids, torch.Tensor) else 0
 
+    def _next_synchronized_batch(self, iterator):
+        """Fetch one batch, ending the epoch on every rank at the same time.
+
+        Length-grouped streaming batches do not necessarily yield an identical
+        number of batches per DDP rank.  Letting an exhausted rank enter epoch
+        handling while another rank still calls backward deadlocks DDP and can
+        also make the ranks take different validation schedules.  We therefore
+        collectively stop at the first exhausted rank; a batch fetched by a
+        longer rank for that final probe is intentionally discarded.
+        """
+        try:
+            batch = next(iterator)
+            has_batch = 1
+        except StopIteration:
+            batch = None
+            has_batch = 0
+        common_has_batch = self.accelerator.reduce(
+            torch.tensor(has_batch, device=self.accelerator.device), reduction="min"
+        )
+        return batch if int(common_has_batch.item()) else None
+
+    def _assert_rank_bool_consensus(self, value: bool, name: str) -> None:
+        """Fail deterministically if a control-flow branch differs by rank.
+
+        A branch containing checkpointing or generation validation must be
+        entered by every DDP rank.  Without this check, one rank can start a
+        barrier while another rank starts a different collective, producing an
+        opaque NCCL timeout many hours later.
+        """
+        local = torch.tensor(int(value), device=self.accelerator.device)
+        minimum = self.accelerator.reduce(local, reduction="min")
+        maximum = self.accelerator.reduce(local, reduction="max")
+        if int(minimum.item()) != int(maximum.item()):
+            raise RuntimeError(
+                f"DDP rank disagreement for {name}: validation/checkpoint "
+                "control flow must be identical on every rank"
+            )
+
+    def _seek_resumed_iterator(self, iterator, microbatches: int) -> None:
+        """Advance a restored iterable stream without one collective per batch.
+
+        ``_epoch_microbatches`` is written only after a batch has passed the
+        normal cross-rank availability check.  Every rank must therefore have
+        exactly that many deterministic batches on restore.  Calling
+        ``_next_synchronized_batch`` for every skipped item needlessly issues
+        thousands of NCCL reductions before the first optimizer update, which
+        can make a restart slower than the training itself.  Seek locally, then
+        perform one collective integrity check before allowing gradients.
+        """
+        local_complete = 1
+        for _ in range(microbatches):
+            try:
+                next(iterator)
+            except StopIteration:
+                local_complete = 0
+                break
+        complete_on_all_ranks = self.accelerator.reduce(
+            torch.tensor(local_complete, device=self.accelerator.device),
+            reduction="min",
+        )
+        if not int(complete_on_all_ranks.item()):
+            raise RuntimeError(
+                "Saved iterable-dataset position exceeds the restored epoch "
+                "on at least one DDP rank"
+            )
+
     def _init_accelerator(self) -> Accelerator:
         """Initialize Accelerator, DeepSpeed, and Logging."""
         # TF32 setup
@@ -127,7 +201,11 @@ class OmniTrainer:
 
         # Init handlers
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-        init_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=60))
+        init_kwargs = InitProcessGroupKwargs(
+            timeout=timedelta(
+                minutes=max(1, int(getattr(self.config, "distributed_timeout_minutes", 480)))
+            )
+        )
 
         # DeepSpeed setup
         deepspeed_plugin = None
@@ -203,7 +281,7 @@ class OmniTrainer:
     def create_optimizer_and_scheduler(self):
         """Default AdamW + configurable LR Scheduler."""
         optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            (p for p in self.model.parameters() if p.requires_grad),
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
@@ -240,11 +318,157 @@ class OmniTrainer:
         if self.accelerator.is_main_process and hasattr(self.config, "save_to_json"):
             checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{step}")
             self.config.save_to_json(os.path.join(checkpoint_dir, "train_config.json"))
+            # Accelerate restores model/optimizer/RNG state, but it deliberately
+            # does not know where an IterableDataset iterator was.  Persist that
+            # position here so a resume neither repeats the beginning of an epoch
+            # nor silently turns a requested N-epoch run into more epochs.
+            with open(os.path.join(checkpoint_dir, "trainer_state.json"), "w") as handle:
+                json.dump(
+                    {
+                        "format_version": 1,
+                        "global_step": int(self.global_step),
+                        "epoch": int(self.epoch),
+                        "epoch_microbatches": int(getattr(self, "_epoch_microbatches", 0)),
+                        "epoch_steps": int(getattr(self, "_epoch_step", 0)),
+                        "epoch_samples": int(getattr(self, "_epoch_samples", 0)),
+                        "evals_this_epoch": int(getattr(self, "_evals_this_epoch", 0)),
+                    },
+                    handle,
+                )
+            model = self.accelerator.unwrap_model(self.model)
+            if hasattr(getattr(model, "llm", None), "peft_config"):
+                adapter_dir = os.path.join(checkpoint_dir, "lora_adapter")
+                model.llm.save_pretrained(adapter_dir, safe_serialization=True)
+                save_lora_audio_modules(model, adapter_dir, base_omnivoice_checkpoint=self.config.init_from_checkpoint)
+                save_lora_trainable_modules(model, adapter_dir)
+        # A lightweight LoRA artifact is written only by rank 0.  Do not allow
+        # peers to start the next collective (or external validation) until the
+        # complete artifact is visible to every rank.
+        self.accelerator.wait_for_everyone()
+
+    def run_hard_number_generation_eval(self, step):
+        if not getattr(self.config, "hard_number_eval_enabled", False):
+            return
+        checkpoint = os.path.join(self.config.output_dir, f"checkpoint-{step}")
+        output = os.path.join(checkpoint, "hard_number_eval")
+
+        # The full hard-number scorer deliberately reloads the checkpoint in a
+        # separate process so generation and GigaAM are isolated from the
+        # training graph.  Keeping a DDP training replica resident on GPU 0 at
+        # the same time, however, leaves too little memory for that second
+        # model.  Offload every rank (including optimizer moments and stale
+        # gradients) while the external process owns the GPUs, then restore the
+        # identical training state afterwards.  This keeps the required full
+        # 2,000-utterance validation rather than silently shrinking it.
+        logger.info("Hard-number evaluation: offloading training state on all ranks")
+        self._offload_training_state_for_external_eval()
+        self.accelerator.wait_for_everyone()
+        failure_path = os.path.join(output, "FAILED")
+        try:
+            if self.accelerator.is_main_process:
+                os.makedirs(output, exist_ok=True)
+                if os.path.exists(failure_path):
+                    os.unlink(failure_path)
+                samples_per_voice = getattr(self.config, "hard_number_eval_samples_per_voice", 50)
+                command = [sys.executable, "-m", "omnivoice.scripts.hard_number_voice_generation_eval", "--checkpoint", checkpoint, "--dataset-path", self.config.hard_number_eval_dataset_path, "--voice-manifest-path", self.config.hard_number_eval_voice_manifest_path, "--output-dir", output, "--selection-path", os.path.join(self.config.output_dir, "hard_number_voice_selection_omnivoice8.json"), "--num-voices", str(self.config.hard_number_eval_voice_count), "--selection-seed", str(self.config.hard_number_eval_seed), "--batch-size", str(self.config.hard_number_eval_batch_size), "--samples-per-voice", str(samples_per_voice), "--gigaam-model", self.config.hard_number_eval_model_name]
+                # Bound the periodic sweep.  The full ~2,000-pair validation
+                # costs 40-80 minutes, and every non-zero rank sits in an NCCL
+                # barrier for its duration; four of those per epoch dominate
+                # the run and widen the window for a collective timeout.
+                max_pairs = getattr(self.config, "hard_number_eval_max_pairs", 0)
+                if max_pairs:
+                    command += ["--max-pairs", str(max_pairs)]
+                excluded = getattr(self.config, "hard_number_eval_excluded_speaker_keys_path", None)
+                if excluded:
+                    command += ["--excluded-speaker-keys-path", excluded]
+                done = subprocess.run(command, text=True, capture_output=True)
+                with open(os.path.join(output, "runner.log"), "w") as handle:
+                    handle.write(done.stdout + done.stderr)
+                if done.returncode:
+                    with open(failure_path, "w") as handle:
+                        handle.write(f"exit code {done.returncode}; see runner.log\n")
+                else:
+                    metrics = json.load(open(os.path.join(output, "metrics.json")))
+                    self.accelerator.log({f"hard_number/{k}": float(v) for k,v in metrics.items() if isinstance(v, (int,float))}, step=step)
+                    # Metrics are written *inside* the checkpoint directory, so
+                    # keep_last_n_checkpoints deletes the eval history along
+                    # with the weights and the run loses its own trend line.
+                    # Mirror them out to a directory the pruner never touches.
+                    history = os.path.join(self.config.output_dir, "validation_history", f"step-{step}")
+                    os.makedirs(history, exist_ok=True)
+                    for name in ("metrics.json", "per_utt.jsonl"):
+                        source = os.path.join(output, name)
+                        if os.path.isfile(source):
+                            shutil.copy2(source, os.path.join(history, name))
+        except Exception as error:
+            if self.accelerator.is_main_process:
+                os.makedirs(output, exist_ok=True)
+                with open(failure_path, "w") as handle:
+                    handle.write(f"{type(error).__name__}: {error}\n")
+            logger.exception("Hard-number evaluation failed before completion")
+        finally:
+            # Keep *every* DDP replica on CPU while rank 0 owns GPU 0 for
+            # generation/GigaAM.  The rendezvous happens before restoration,
+            # so no rank can resume collectives or allocate model memory early.
+            self.accelerator.wait_for_everyone()
+            logger.info("Hard-number evaluation: restoring training state on all ranks")
+            self._restore_training_state_after_external_eval()
+        self.accelerator.wait_for_everyone()
+        if os.path.isfile(failure_path):
+            raise RuntimeError(f"Hard-number validation failed; see {output}/runner.log")
+
+    def _move_optimizer_state(self, device):
+        """Move Adam state tensors without replacing the optimizer's state map."""
+        for state in self.optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device, non_blocking=device.type == "cuda")
+
+    def _offload_training_state_for_external_eval(self):
+        """Free GPU memory on every DDP rank for an external full generator."""
+        self.model.eval()
+        for parameter in self.model.parameters():
+            parameter.grad = None
+        self.model.to("cpu")
+        self._move_optimizer_state(torch.device("cpu"))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _restore_training_state_after_external_eval(self):
+        """Return a temporary CPU-offloaded DDP replica to its original GPU."""
+        device = self.accelerator.device
+        self.model.to(device)
+        self._move_optimizer_state(device)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.model.train()
 
     def load_checkpoint(self, checkpoint_path):
         """Wrapper for loading."""
         step = load_checkpoint(self.accelerator, checkpoint_path)
         self.global_step = step
+        state_path = os.path.join(checkpoint_path, "trainer_state.json")
+        if os.path.isfile(state_path):
+            with open(state_path) as handle:
+                state = json.load(handle)
+            self.epoch = int(state.get("epoch", 0))
+            self._epoch_microbatches = int(state.get("epoch_microbatches", 0))
+            self._epoch_step = int(state.get("epoch_steps", 0))
+            self._epoch_samples = int(state.get("epoch_samples", 0))
+            self._evals_this_epoch = int(state.get("evals_this_epoch", 0))
+            logger.info(
+                "Restored epoch progress: epoch=%d microbatches=%d updates=%d samples=%d evals=%d",
+                self.epoch,
+                self._epoch_microbatches,
+                self._epoch_step,
+                self._epoch_samples,
+                self._evals_this_epoch,
+            )
+        else:
+            logger.warning(
+                "Checkpoint has no trainer_state.json; exact iterable-dataset resume is unavailable. "
+                "Start a fresh epoch-boundary run instead of continuing this checkpoint."
+            )
         logger.info(f"Resumed from step {self.global_step}")
         return step
 
@@ -302,8 +526,55 @@ class OmniTrainer:
         logger.info("Starting Training Loop...")
 
         # Resume if configured
-        if self.config.resume_from_checkpoint:
+        checkpoint_model_state = (
+            os.path.join(self.config.resume_from_checkpoint, "model.safetensors")
+            if self.config.resume_from_checkpoint
+            else None
+        )
+        has_full_engine_state = bool(
+            checkpoint_model_state
+            and os.path.isfile(checkpoint_model_state)
+            and os.path.getsize(checkpoint_model_state) > 0
+        )
+        if (
+            self.config.resume_from_checkpoint
+            and not getattr(self.config, "resume_weights_only", False)
+            and has_full_engine_state
+        ):
             self.load_checkpoint(self.config.resume_from_checkpoint)
+        elif self.config.resume_from_checkpoint:
+            # The builder has already restored the adapter and optional audio
+            # sidecar.  Do not load Accelerate state here: its optimizer and
+            # scheduler parameter groups can legitimately differ from this
+            # targeted continuation.  A lightweight checkpoint deliberately
+            # has no optimizer state, but it can still continue at the saved
+            # global step and deterministic iterable position (especially
+            # important for constant-LR LoRA recovery after an external eval).
+            state_path = os.path.join(
+                self.config.resume_from_checkpoint, "trainer_state.json"
+            )
+            if (
+                not getattr(self.config, "resume_weights_only", False)
+                and os.path.isfile(state_path)
+            ):
+                with open(state_path) as handle:
+                    state = json.load(handle)
+                self.global_step = int(state.get("global_step", 0))
+                self.epoch = int(state.get("epoch", 0))
+                self._epoch_microbatches = int(state.get("epoch_microbatches", 0))
+                self._epoch_step = int(state.get("epoch_steps", 0))
+                self._epoch_samples = int(state.get("epoch_samples", 0))
+                self._evals_this_epoch = int(state.get("evals_this_epoch", 0))
+                logger.info(
+                    "Restored lightweight LoRA position from %s at step %d with a fresh optimizer/scheduler",
+                    self.config.resume_from_checkpoint,
+                    self.global_step,
+                )
+            else:
+                logger.info(
+                    "Initialized adapter weights from %s with fresh optimizer, scheduler, and data iterator",
+                    self.config.resume_from_checkpoint,
+                )
 
         # Handle IterableDataset Epochs
         if hasattr(self.train_dataloader.dataset, "set_epoch"):
@@ -328,9 +599,14 @@ class OmniTrainer:
         tr_loss = torch.tensor(0.0).to(self.accelerator.device)
         logging_loss_scalar = 0.0
 
-        epoch_step = 0
-        epoch_samples = 0
-        evals_this_epoch = 0
+        # These counters are checkpointed because the training dataset is an
+        # IterableDataset.  Recreating its iterator without skipping the
+        # consumed microbatches repeats data after every restart.
+        epoch_step = int(getattr(self, "_epoch_step", 0))
+        epoch_samples = int(getattr(self, "_epoch_samples", 0))
+        evals_this_epoch = int(getattr(self, "_evals_this_epoch", 0))
+        epoch_microbatches = int(getattr(self, "_epoch_microbatches", 0))
+        fourth_epoch_tail = False
         epoch_sample_total = self._epoch_sample_total()
         sample_eval_targets = []
         if getattr(self.config, "evals_per_epoch", 0) > 0 and epoch_sample_total:
@@ -352,26 +628,52 @@ class OmniTrainer:
                 ),
             )
 
+        # Seek each rank through its deterministic stream before its first
+        # resumed batch.  This is intentionally done before the training loop
+        # so it cannot contribute gradients or epoch sample accounting.
+        if epoch_microbatches:
+            logger.info(
+                "Seeking resumed IterableDataset to microbatch %d of epoch %d",
+                epoch_microbatches,
+                self.epoch,
+            )
+            self._seek_resumed_iterator(train_iterator, epoch_microbatches)
+
         while self.global_step < self.config.steps:
-            try:
-                batch = next(train_iterator)
-            except StopIteration:
+            batch = self._next_synchronized_batch(train_iterator)
+            if batch is None:
                 # Make sure the end of every completed epoch receives a full
                 # validation pass when using an epoch-relative schedule.
                 if (
-                    self.eval_dataloader is not None
-                    and getattr(self.config, "evals_per_epoch", 0) > 0
+                    getattr(self.config, "evals_per_epoch", 0) > 0
                     and evals_this_epoch < self.config.evals_per_epoch
                 ):
-                    self.evaluate()
+                    if getattr(self.config, "save_before_evaluation", False):
+                        self.save_checkpoint(self.global_step)
+                    if self.eval_dataloader is not None:
+                        self.evaluate()
+                    self.run_hard_number_generation_eval(self.global_step)
                 train_logger.close_epoch()
                 self.epoch += 1
                 if (
                     getattr(self.config, "max_epochs", None) is not None
                     and self.epoch >= self.config.max_epochs
                 ):
-                    logger.info("Reached configured max_epochs=%s", self.config.max_epochs)
-                    break
+                    # The requested scheduler horizon can be a small number of
+                    # updates longer than four full iterable-dataset passes.
+                    # Keep the fourth epoch deterministic and open only that
+                    # short tail; do not begin a fifth epoch or schedule an
+                    # extra validation.
+                    if self.global_step >= self.config.steps:
+                        logger.info("Reached configured max_epochs=%s", self.config.max_epochs)
+                        break
+                    self.epoch = self.config.max_epochs - 1
+                    fourth_epoch_tail = True
+                    logger.info(
+                        "Completed four source epochs at step %d; continuing deterministic fourth-epoch tail to step %d",
+                        self.global_step,
+                        self.config.steps,
+                    )
                 logger.info(f"Epoch {self.epoch} starting. Resetting dataloader...")
                 if hasattr(self.train_dataloader.dataset, "set_epoch"):
                     self.train_dataloader.dataset.set_epoch(self.epoch)
@@ -380,10 +682,33 @@ class OmniTrainer:
                 train_logger.start_epoch(self.epoch, epoch_total)
                 epoch_step = 0
                 epoch_samples = 0
-                evals_this_epoch = 0
-                batch = next(train_iterator)
+                evals_this_epoch = (
+                    getattr(self.config, "evals_per_epoch", 0)
+                    if fourth_epoch_tail
+                    else 0
+                )
+                epoch_microbatches = 0
+                self._epoch_step = 0
+                self._epoch_samples = 0
+                self._evals_this_epoch = evals_this_epoch
+                self._epoch_microbatches = 0
+                # All ranks start the next epoch together.  A completely empty
+                # epoch is an invalid dataset/configuration rather than a DDP
+                # synchronization condition to spin through.
+                batch = self._next_synchronized_batch(train_iterator)
+                if batch is None:
+                    raise RuntimeError("No synchronized training batches were produced for the epoch")
 
             batch = _to_device(batch, self.accelerator.device)
+            epoch_microbatches += 1
+            self._epoch_microbatches = epoch_microbatches
+            # Count every accumulation microbatch for epoch-relative validation.
+            local_samples = self._batch_sample_count(batch)
+            global_samples = self.accelerator.reduce(
+                torch.tensor(local_samples, device=self.accelerator.device), reduction="sum"
+            )
+            epoch_samples += int(global_samples.item())
+            self._epoch_samples = epoch_samples
 
             with self.accelerator.accumulate(self.model):
                 outputs = self.model(**batch)
@@ -405,12 +730,7 @@ class OmniTrainer:
                     self.optimizer.zero_grad()
                     self.global_step += 1
                     epoch_step += 1
-                    local_samples = self._batch_sample_count(batch)
-                    global_samples = self.accelerator.reduce(
-                        torch.tensor(local_samples, device=self.accelerator.device),
-                        reduction="sum",
-                    )
-                    epoch_samples += int(global_samples.item())
+                    self._epoch_step = epoch_step
 
                     # Logging
                     current_lr = self.lr_scheduler.get_last_lr()[0]
@@ -466,13 +786,20 @@ class OmniTrainer:
                             )
                         )
                     )
-                    did_evaluate = self.eval_dataloader is not None and (
-                        scheduled_global_eval or scheduled_epoch_eval
+                    did_evaluate = scheduled_global_eval or scheduled_epoch_eval
+                    self._assert_rank_bool_consensus(
+                        did_evaluate,
+                        f"evaluation scheduling at global step {self.global_step}",
                     )
                     if did_evaluate:
-                        self.evaluate()
+                        if getattr(self.config, "save_before_evaluation", False):
+                            self.save_checkpoint(self.global_step)
+                        if self.eval_dataloader is not None:
+                            self.evaluate()
+                        self.run_hard_number_generation_eval(self.global_step)
                         if scheduled_epoch_eval:
                             evals_this_epoch += 1
+                            self._evals_this_epoch = evals_this_epoch
 
                     # Save
                     if did_evaluate and getattr(
@@ -486,6 +813,7 @@ class OmniTrainer:
                         self.save_checkpoint(self.global_step)
 
         # Final Save
-        self.save_checkpoint(self.global_step)
+        if getattr(self.config, "save_final_checkpoint", True):
+            self.save_checkpoint(self.global_step)
         train_logger.close()
         self.accelerator.end_training()

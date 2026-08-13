@@ -33,6 +33,8 @@ Key functions:
 """
 
 import logging
+import os
+import re
 from functools import partial
 from typing import Tuple
 
@@ -120,6 +122,62 @@ def build_model_and_tokenizer(
         model.llm.resize_token_embeddings(len(tokenizer))
         model.config.llm_config.vocab_size = len(tokenizer)
 
+    if config.lora_rank > 0:
+        from peft import LoraConfig, PeftModel, get_peft_model
+        from omnivoice.training.checkpoint import (
+            load_lora_audio_modules,
+            load_lora_trainable_modules,
+        )
+
+        lora_config = LoraConfig(
+            r=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            target_modules=list(config.lora_target_modules),
+            bias="none",
+        )
+        adapter_dir = None
+        # Lightweight LoRA checkpoints intentionally omit a duplicate frozen
+        # base model.  If their adapter sidecar exists, initialize from it;
+        # a full Accelerate-state restore can still overwrite it afterwards.
+        if config.resume_from_checkpoint:
+            candidate = os.path.join(config.resume_from_checkpoint, "lora_adapter")
+            if os.path.isdir(candidate):
+                adapter_dir = candidate
+        model.llm = (
+            PeftModel.from_pretrained(model.llm, adapter_dir, is_trainable=True)
+            if adapter_dir else get_peft_model(model.llm, lora_config)
+        )
+        if adapter_dir:
+            load_lora_audio_modules(model, adapter_dir)
+        # Audio modules are outside the PEFT wrapper and default to trainable.
+        # Explicitly respect the LoRA-only setting.
+        for module in (model.audio_embeddings, model.audio_heads):
+            for parameter in module.parameters():
+                parameter.requires_grad_(bool(config.lora_train_audio_modules))
+        last_n_layers = int(getattr(config, "lora_train_last_n_layers", 0) or 0)
+        if last_n_layers > 0:
+            layer_matches = []
+            for name, parameter in model.llm.named_parameters():
+                match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+                if match:
+                    layer_matches.append((int(match.group(1)), parameter))
+            if not layer_matches:
+                raise RuntimeError("Could not locate transformer layers for LoRA suffix tuning")
+            first_trainable_layer = max(index for index, _ in layer_matches) - last_n_layers + 1
+            suffix_parameters = 0
+            for index, parameter in layer_matches:
+                if index >= first_trainable_layer:
+                    parameter.requires_grad_(True)
+                    suffix_parameters += parameter.numel()
+            logger.info(
+                "Enabled full training for final %d transformer layers (%d parameters)",
+                last_n_layers,
+                suffix_parameters,
+            )
+        if adapter_dir:
+            load_lora_trainable_modules(model, adapter_dir)
+
     # 4. Config IDs
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
@@ -158,7 +216,18 @@ def build_dataloaders(
     train_manifests, dev_manifests = prepare_data_manifests_from_json(
         config.data_config
     )
-    raw_train_ds = WebDatasetReader(manifests=train_manifests, evaluation=False)
+    raw_train_ds = WebDatasetReader(
+        manifests=train_manifests,
+        evaluation=False,
+        label_text_regex=config.train_label_text_regex,
+        label_text_keep_ratio=getattr(config, "train_label_text_keep_ratio", 0.0),
+    )
+    if getattr(config, "train_epoch_sample_count", None):
+        raw_train_ds.num_items = int(config.train_epoch_sample_count)
+        logger.info(
+            "Using effective filtered epoch sample count: %d",
+            raw_train_ds.num_items,
+        )
 
     use_packing = config.attn_implementation == "flex_attention"
 
